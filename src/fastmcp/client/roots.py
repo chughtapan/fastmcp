@@ -21,10 +21,10 @@ def convert_roots_list(roots: RootsList) -> list[mcp.types.Root]:
     for r in roots:
         if isinstance(r, mcp.types.Root):
             roots_list.append(r)
-        elif isinstance(r, pydantic.FileUrl):
+        elif isinstance(r, pydantic.AnyUrl):
             roots_list.append(mcp.types.Root(uri=r))
         elif isinstance(r, str):
-            roots_list.append(mcp.types.Root(uri=pydantic.FileUrl(r)))
+            roots_list.append(mcp.types.Root(uri=pydantic.AnyUrl(r)))
         else:
             raise ValueError(f"Invalid root: {r}")
     return roots_list
