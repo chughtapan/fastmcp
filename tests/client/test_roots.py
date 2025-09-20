@@ -25,20 +25,22 @@ class TestClientRoots:
             async with Client(fastmcp_server, roots=roots):
                 pass
 
-    @pytest.mark.parametrize("roots", [["https://x.com"]])
-    async def test_invalid_urls(self, fastmcp_server: FastMCP, roots: list[str]):
-        """
-        At this time, root URIs must start with file://
-        """
-        with pytest.raises(ValueError, match="URL scheme should be 'file'"):
-            async with Client(fastmcp_server, roots=roots):
-                pass
-
     @pytest.mark.parametrize("roots", [["file://x/y/z", "file://x/y/z"]])
-    async def test_valid_roots(self, fastmcp_server: FastMCP, roots: list[str]):
+    async def test_file_roots(self, fastmcp_server: FastMCP, roots: list[str]):
         async with Client(fastmcp_server, roots=roots) as client:
             result = await client.call_tool("list_roots", {})
             assert result.data == [
                 "file://x/y/z",
                 "file://x/y/z",
+            ]
+
+    @pytest.mark.parametrize("roots", [["https://x.com", "custom://protocol/resource"]])
+    async def test_non_file_roots(self, fastmcp_server: FastMCP, roots: list[str]):
+        """Test that non-file URI schemes are now supported"""
+        async with Client(fastmcp_server, roots=roots) as client:
+            result = await client.call_tool("list_roots", {})
+            # URL normalization: https URLs get trailing slash, custom schemes don't
+            assert result.data == [
+                "https://x.com/",
+                "custom://protocol/resource",
             ]
