@@ -1553,7 +1553,7 @@ class Client(Generic[ClientTransportT]):
         if result.is_error and raise_on_error:
             msg = cast(mcp.types.TextContent, result.content[0]).text
             raise ToolError(msg)
-        elif result.structuredContent:
+        elif result.structured_content:
             try:
                 if name not in self.session._tool_output_schemas:
                     await self.session.list_tools()
@@ -1564,20 +1564,20 @@ class Client(Generic[ClientTransportT]):
                             output_schema = output_schema.get("properties", {}).get(
                                 "result"
                             )
-                            structured_content = result.structuredContent.get("result")
+                            structured_content = result.structured_content.get("result")
                         else:
-                            structured_content = result.structuredContent
+                            structured_content = result.structured_content
                         output_type = json_schema_to_type(output_schema)
                         type_adapter = get_cached_typeadapter(output_type)
                         data = type_adapter.validate_python(structured_content)
                     else:
-                        data = result.structuredContent
+                        data = result.structured_content
             except Exception as e:
                 logger.error(f"[{self.name}] Error parsing structured content: {e}")
 
         return CallToolResult(
             content=result.content,
-            structured_content=result.structuredContent,
+            structured_content=result.structured_content,
             meta=result.meta,
             data=data,
             is_error=result.is_error,
