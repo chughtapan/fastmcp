@@ -1550,7 +1550,7 @@ class Client(Generic[ClientTransportT]):
             CallToolResult: Parsed result with structured data
         """
         data = None
-        if result.isError and raise_on_error:
+        if result.is_error and raise_on_error:
             msg = cast(mcp.types.TextContent, result.content[0]).text
             raise ToolError(msg)
         elif result.structuredContent:
@@ -1580,7 +1580,7 @@ class Client(Generic[ClientTransportT]):
             structured_content=result.structuredContent,
             meta=result.meta,
             data=data,
-            is_error=result.isError,
+            is_error=result.is_error,
         )
 
     @overload
