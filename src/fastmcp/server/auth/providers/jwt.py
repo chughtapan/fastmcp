@@ -11,14 +11,12 @@ from authlib.jose import JsonWebKey, JsonWebToken
 from authlib.jose.errors import JoseError
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from pydantic import AnyHttpUrl, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AnyHttpUrl, SecretStr
 from typing_extensions import TypedDict
 
 from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.utilities.auth import parse_scopes
 from fastmcp.utilities.logging import get_logger
-from fastmcp.utilities.types import NotSet, NotSetT
 
 logger = get_logger(__name__)
 
@@ -138,29 +136,6 @@ class RSAKeyPair:
         return token_bytes.decode("utf-8")
 
 
-class JWTVerifierSettings(BaseSettings):
-    """Settings for JWT token verification."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="FASTMCP_SERVER_AUTH_JWT_",
-        env_file=".env",
-        extra="ignore",
-    )
-
-    public_key: str | None = None
-    jwks_uri: str | None = None
-    issuer: str | None = None
-    algorithm: str | None = None
-    audience: str | list[str] | None = None
-    required_scopes: list[str] | None = None
-    base_url: AnyHttpUrl | str | None = None
-
-    @field_validator("required_scopes", mode="before")
-    @classmethod
-    def _parse_scopes(cls, v):
-        return parse_scopes(v)
-
-
 class JWTVerifier(TokenVerifier):
     """
     JWT token verifier supporting both asymmetric (RSA/ECDSA) and symmetric (HMAC) algorithms.
@@ -183,52 +158,36 @@ class JWTVerifier(TokenVerifier):
     def __init__(
         self,
         *,
-        public_key: str | None | NotSetT = NotSet,
-        jwks_uri: str | None | NotSetT = NotSet,
-        issuer: str | None | NotSetT = NotSet,
-        audience: str | list[str] | None | NotSetT = NotSet,
-        algorithm: str | None | NotSetT = NotSet,
-        required_scopes: list[str] | None | NotSetT = NotSet,
-        base_url: AnyHttpUrl | str | None | NotSetT = NotSet,
+        public_key: str | None = None,
+        jwks_uri: str | None = None,
+        issuer: str | list[str] | None = None,
+        audience: str | list[str] | None = None,
+        algorithm: str | None = None,
+        required_scopes: list[str] | None = None,
+        base_url: AnyHttpUrl | str | None = None,
     ):
         """
-        Initialize the JWT token verifier.
+        Initialize a JWTVerifier configured to validate JWTs using either a static key or a JWKS endpoint.
 
-        Args:
-            public_key: For asymmetric algorithms (RS256, ES256, etc.): PEM-encoded public key.
-                       For symmetric algorithms (HS256, HS384, HS512): The shared secret string.
-            jwks_uri: URI to fetch JSON Web Key Set (only for asymmetric algorithms)
-            issuer: Expected issuer claim
-            audience: Expected audience claim(s)
-            algorithm: JWT signing algorithm. Supported algorithms:
-                      - Asymmetric: RS256/384/512, ES256/384/512, PS256/384/512 (default: RS256)
-                      - Symmetric: HS256, HS384, HS512
-            required_scopes: Required scopes for all tokens
-            base_url: Base URL for TokenVerifier protocol
+        Parameters:
+            public_key: PEM-encoded public key for asymmetric algorithms or shared secret for symmetric algorithms.
+            jwks_uri: URI to fetch a JSON Web Key Set; used when verifying tokens with remote JWKS.
+            issuer: Expected issuer claim value or list of allowed issuer values.
+            audience: Expected audience claim value or list of allowed audience values.
+            algorithm: JWT signing algorithm to accept (default: "RS256"). Supported: HS256/384/512, RS256/384/512, ES256/384/512, PS256/384/512.
+            required_scopes: Scopes that must be present in validated tokens.
+            base_url: Base URL passed to the parent TokenVerifier.
+
+        Raises:
+            ValueError: If neither or both of `public_key` and `jwks_uri` are provided, or if `algorithm` is unsupported.
         """
-        settings = JWTVerifierSettings.model_validate(
-            {
-                k: v
-                for k, v in {
-                    "public_key": public_key,
-                    "jwks_uri": jwks_uri,
-                    "issuer": issuer,
-                    "audience": audience,
-                    "algorithm": algorithm,
-                    "required_scopes": required_scopes,
-                    "base_url": base_url,
-                }.items()
-                if v is not NotSet
-            }
-        )
-
-        if not settings.public_key and not settings.jwks_uri:
+        if not public_key and not jwks_uri:
             raise ValueError("Either public_key or jwks_uri must be provided")
 
-        if settings.public_key and settings.jwks_uri:
+        if public_key and jwks_uri:
             raise ValueError("Provide either public_key or jwks_uri, not both")
 
-        algorithm = settings.algorithm or "RS256"
+        algorithm = algorithm or "RS256"
         if algorithm not in {
             "HS256",
             "HS384",
@@ -245,17 +204,22 @@ class JWTVerifier(TokenVerifier):
         }:
             raise ValueError(f"Unsupported algorithm: {algorithm}.")
 
+        # Parse scopes if provided as string
+        parsed_required_scopes = (
+            parse_scopes(required_scopes) if required_scopes is not None else None
+        )
+
         # Initialize parent TokenVerifier
         super().__init__(
-            base_url=settings.base_url,
-            required_scopes=settings.required_scopes,
+            base_url=base_url,
+            required_scopes=parsed_required_scopes,
         )
 
         self.algorithm = algorithm
-        self.issuer = settings.issuer
-        self.audience = settings.audience
-        self.public_key = settings.public_key
-        self.jwks_uri = settings.jwks_uri
+        self.issuer = issuer
+        self.audience = audience
+        self.public_key = public_key
+        self.jwks_uri = jwks_uri
         self.jwt = JsonWebToken([self.algorithm])
         self.logger = get_logger(__name__)
 
@@ -282,7 +246,7 @@ class JWTVerifier(TokenVerifier):
             return await self._get_jwks_key(kid)
 
         except Exception as e:
-            raise ValueError(f"Failed to extract key ID from token: {e}")
+            raise ValueError(f"Failed to extract key ID from token: {e}") from e
 
     async def _get_jwks_key(self, kid: str | None) -> str:
         """Fetch key from JWKS with simple caching."""
@@ -311,7 +275,7 @@ class JWTVerifier(TokenVerifier):
             for key_data in jwks_data.get("keys", []):
                 key_kid = key_data.get("kid")
                 jwk = JsonWebKey.import_key(key_data)
-                public_key = jwk.get_public_key()  # type: ignore
+                public_key = jwk.get_public_key()
 
                 if key_kid:
                     self._jwks_cache[key_kid] = public_key
@@ -341,10 +305,10 @@ class JWTVerifier(TokenVerifier):
                     raise ValueError("No keys found in JWKS")
 
         except httpx.HTTPError as e:
-            raise ValueError(f"Failed to fetch JWKS: {e}")
+            raise ValueError(f"Failed to fetch JWKS: {e}") from e
         except Exception as e:
             self.logger.debug(f"JWKS fetch failed: {e}")
-            raise ValueError(f"Failed to fetch JWKS: {e}")
+            raise ValueError(f"Failed to fetch JWKS: {e}") from e
 
     def _extract_scopes(self, claims: dict[str, Any]) -> list[str]:
         """
@@ -365,13 +329,13 @@ class JWTVerifier(TokenVerifier):
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         """
-        Validates the provided JWT bearer token.
+        Validate a JWT bearer token and return an AccessToken when the token is valid.
 
-        Args:
-            token: The JWT token string to validate
+        Parameters:
+            token (str): The JWT bearer token string to validate.
 
         Returns:
-            AccessToken object if valid, None if invalid or expired
+            AccessToken | None: An AccessToken populated from token claims if the token is valid; `None` if the token is expired, has an invalid signature or format, fails issuer/audience/scope validation, or any other validation error occurs.
         """
         try:
             # Get verification key (static or from JWKS)
@@ -381,7 +345,12 @@ class JWTVerifier(TokenVerifier):
             claims = self.jwt.decode(token, verification_key)
 
             # Extract client ID early for logging
-            client_id = claims.get("client_id") or claims.get("sub") or "unknown"
+            client_id = (
+                claims.get("client_id")
+                or claims.get("azp")
+                or claims.get("sub")
+                or "unknown"
+            )
 
             # Validate expiration
             exp = claims.get("exp")
@@ -395,7 +364,18 @@ class JWTVerifier(TokenVerifier):
             # Validate issuer - note we use issuer instead of issuer_url here because
             # issuer is optional, allowing users to make this check optional
             if self.issuer:
-                if claims.get("iss") != self.issuer:
+                iss = claims.get("iss")
+
+                # Handle different combinations of issuer types
+                issuer_valid = False
+                if isinstance(self.issuer, list):
+                    # self.issuer is a list - check if token issuer matches any expected issuer
+                    issuer_valid = iss in self.issuer
+                else:
+                    # self.issuer is a string - check for equality
+                    issuer_valid = iss == self.issuer
+
+                if not issuer_valid:
                     self.logger.debug(
                         "Token validation failed: issuer mismatch for client %s",
                         client_id,

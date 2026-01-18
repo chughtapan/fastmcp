@@ -1,13 +1,13 @@
 import json
-from collections.abc import Generator
 
 import pytest
+from mcp.types import TextContent, TextResourceContents
 
 from fastmcp.client import Client
 from fastmcp.client.transports import SSETransport, StreamableHttpTransport
 from fastmcp.server.dependencies import get_http_request
 from fastmcp.server.server import FastMCP
-from fastmcp.utilities.tests import run_server_in_process
+from fastmcp.utilities.tests import run_server_async
 
 
 def fastmcp_server():
@@ -22,10 +22,11 @@ def fastmcp_server():
         return dict(request.headers)
 
     @server.resource(uri="request://headers")
-    async def get_headers_resource() -> dict[str, str]:
-        request = get_http_request()
+    async def get_headers_resource() -> str:
+        import json
 
-        return dict(request.headers)
+        request = get_http_request()
+        return json.dumps(dict(request.headers))
 
     # Add a prompt
     @server.prompt
@@ -38,20 +39,20 @@ def fastmcp_server():
     return server
 
 
-def run_server(host: str, port: int, **kwargs) -> None:
-    fastmcp_server().run(host=host, port=port, **kwargs)
+@pytest.fixture
+async def shttp_server():
+    """Start a test server with StreamableHttp transport."""
+    server = fastmcp_server()
+    async with run_server_async(server, transport="http") as url:
+        yield url
 
 
-@pytest.fixture(autouse=True, scope="module")
-def shttp_server() -> Generator[str, None, None]:
-    with run_server_in_process(run_server, transport="http") as url:
-        yield f"{url}/mcp"
-
-
-@pytest.fixture(autouse=True, scope="module")
-def sse_server() -> Generator[str, None, None]:
-    with run_server_in_process(run_server, transport="sse") as url:
-        yield f"{url}/sse"
+@pytest.fixture
+async def sse_server():
+    """Start a test server with SSE transport."""
+    server = fastmcp_server()
+    async with run_server_async(server, transport="sse") as url:
+        yield url
 
 
 async def test_http_headers_resource_shttp(shttp_server: str):
@@ -62,7 +63,8 @@ async def test_http_headers_resource_shttp(shttp_server: str):
         )
     ) as client:
         raw_result = await client.read_resource("request://headers")
-        json_result = json.loads(raw_result[0].text)  # type: ignore[attr-defined]
+        assert isinstance(raw_result[0], TextResourceContents)
+        json_result = json.loads(raw_result[0].text)
         assert "x-demo-header" in json_result
         assert json_result["x-demo-header"] == "ABC"
 
@@ -73,7 +75,8 @@ async def test_http_headers_resource_sse(sse_server: str):
         transport=SSETransport(sse_server, headers={"X-DEMO-HEADER": "ABC"})
     ) as client:
         raw_result = await client.read_resource("request://headers")
-        json_result = json.loads(raw_result[0].text)  # type: ignore[attr-defined]
+        assert isinstance(raw_result[0], TextResourceContents)
+        json_result = json.loads(raw_result[0].text)
         assert "x-demo-header" in json_result
         assert json_result["x-demo-header"] == "ABC"
 
@@ -107,7 +110,8 @@ async def test_http_headers_prompt_shttp(shttp_server: str):
         )
     ) as client:
         result = await client.get_prompt("get_headers_prompt")
-        json_result = json.loads(result.messages[0].content.text)  # type: ignore[attr-defined]
+        assert isinstance(result.messages[0].content, TextContent)
+        json_result = json.loads(result.messages[0].content.text)
         assert "x-demo-header" in json_result
         assert json_result["x-demo-header"] == "ABC"
 
@@ -118,6 +122,7 @@ async def test_http_headers_prompt_sse(sse_server: str):
         transport=SSETransport(sse_server, headers={"X-DEMO-HEADER": "ABC"})
     ) as client:
         result = await client.get_prompt("get_headers_prompt")
-        json_result = json.loads(result.messages[0].content.text)  # type: ignore[attr-defined]
+        assert isinstance(result.messages[0].content, TextContent)
+        json_result = json.loads(result.messages[0].content.text)
         assert "x-demo-header" in json_result
         assert json_result["x-demo-header"] == "ABC"

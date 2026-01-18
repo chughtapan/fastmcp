@@ -6,112 +6,25 @@ using the OAuth Proxy pattern for non-DCR OAuth flows.
 
 from __future__ import annotations
 
-import httpx
-from pydantic import SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import TYPE_CHECKING, Any
 
-from fastmcp.server.auth import AccessToken, TokenVerifier
+from key_value.aio.protocols import AsyncKeyValue
+
 from fastmcp.server.auth.oauth_proxy import OAuthProxy
+from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.utilities.auth import parse_scopes
 from fastmcp.utilities.logging import get_logger
-from fastmcp.utilities.types import NotSet, NotSetT
+
+if TYPE_CHECKING:
+    from mcp.server.auth.provider import AuthorizationParams
+    from mcp.shared.auth import OAuthClientInformationFull
 
 logger = get_logger(__name__)
 
-
-class AzureProviderSettings(BaseSettings):
-    """Settings for Azure OAuth provider."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="FASTMCP_SERVER_AUTH_AZURE_",
-        env_file=".env",
-        extra="ignore",
-    )
-
-    client_id: str | None = None
-    client_secret: SecretStr | None = None
-    tenant_id: str | None = None
-    base_url: str | None = None
-    redirect_path: str | None = None
-    required_scopes: list[str] | None = None
-    timeout_seconds: int | None = None
-    allowed_client_redirect_uris: list[str] | None = None
-
-    @field_validator("required_scopes", mode="before")
-    @classmethod
-    def _parse_scopes(cls, v):
-        return parse_scopes(v)
-
-
-class AzureTokenVerifier(TokenVerifier):
-    """Token verifier for Azure OAuth tokens.
-
-    Azure tokens are JWTs, but we verify them by calling the Microsoft Graph API
-    to get user information and validate the token.
-    """
-
-    def __init__(
-        self,
-        *,
-        required_scopes: list[str] | None = None,
-        timeout_seconds: int = 10,
-    ):
-        """Initialize the Azure token verifier.
-
-        Args:
-            required_scopes: Required OAuth scopes
-            timeout_seconds: HTTP request timeout
-        """
-        super().__init__(required_scopes=required_scopes)
-        self.timeout_seconds = timeout_seconds
-
-    async def verify_token(self, token: str) -> AccessToken | None:
-        """Verify Azure OAuth token by calling Microsoft Graph API."""
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                # Use Microsoft Graph API to validate token and get user info
-                response = await client.get(
-                    "https://graph.microsoft.com/v1.0/me",
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "User-Agent": "FastMCP-Azure-OAuth",
-                    },
-                )
-
-                if response.status_code != 200:
-                    logger.debug(
-                        "Azure token verification failed: %d - %s",
-                        response.status_code,
-                        response.text[:200],
-                    )
-                    return None
-
-                user_data = response.json()
-
-                # Create AccessToken with Azure user info
-                return AccessToken(
-                    token=token,
-                    client_id=str(user_data.get("id", "unknown")),
-                    scopes=self.required_scopes or [],
-                    expires_at=None,
-                    claims={
-                        "sub": user_data.get("id"),
-                        "email": user_data.get("mail")
-                        or user_data.get("userPrincipalName"),
-                        "name": user_data.get("displayName"),
-                        "given_name": user_data.get("givenName"),
-                        "family_name": user_data.get("surname"),
-                        "job_title": user_data.get("jobTitle"),
-                        "office_location": user_data.get("officeLocation"),
-                    },
-                )
-
-        except httpx.RequestError as e:
-            logger.debug("Failed to verify Azure token: %s", e)
-            return None
-        except Exception as e:
-            logger.debug("Azure token verification error: %s", e)
-            return None
+# Standard OIDC scopes that should never be prefixed with identifier_uri.
+# Per Microsoft docs: https://learn.microsoft.com/en-us/entra/identity-platform/scopes-oidc
+# "OIDC scopes are requested as simple string identifiers without resource prefixes"
+OIDC_SCOPES = frozenset({"openid", "profile", "email", "offline_access"})
 
 
 class AzureProvider(OAuthProxy):
@@ -121,28 +34,53 @@ class AzureProvider(OAuthProxy):
     OAuth Proxy pattern. It supports both organizational accounts and personal
     Microsoft accounts depending on the tenant configuration.
 
-    Features:
-    - Transparent OAuth proxy to Azure/Microsoft identity platform
-    - Automatic token validation via Microsoft Graph API
-    - User information extraction
-    - Support for different tenant configurations (common, organizations, consumers)
+    Scope Handling:
+    - required_scopes: Provide unprefixed scope names (e.g., ["read", "write"])
+      → Automatically prefixed with identifier_uri during initialization
+      → Validated on all tokens and advertised to MCP clients
+    - additional_authorize_scopes: Provide full format (e.g., ["User.Read"])
+      → NOT prefixed, NOT validated, NOT advertised to clients
+      → Used to request Microsoft Graph or other upstream API permissions
 
-    Setup Requirements:
-    1. Register an application in Azure Portal (portal.azure.com)
-    2. Configure redirect URI as: http://localhost:8000/auth/callback
-    3. Note your Application (client) ID and create a client secret
-    4. Optionally note your Directory (tenant) ID for single-tenant apps
+    Features:
+    - OAuth proxy to Azure/Microsoft identity platform
+    - JWT validation using tenant issuer and JWKS
+    - Supports tenant configurations: specific tenant ID, "organizations", or "consumers"
+    - Custom API scopes and Microsoft Graph scopes in a single provider
+
+    Setup:
+    1. Create an App registration in Azure Portal
+    2. Configure Web platform redirect URI: http://localhost:8000/auth/callback (or your custom path)
+    3. Add an Application ID URI under "Expose an API" (defaults to api://{client_id})
+    4. Add custom scopes (e.g., "read", "write") under "Expose an API"
+    5. Set access token version to 2 in the App manifest: "requestedAccessTokenVersion": 2
+    6. Create a client secret
+    7. Get Application (client) ID, Directory (tenant) ID, and client secret
 
     Example:
         ```python
         from fastmcp import FastMCP
         from fastmcp.server.auth.providers.azure import AzureProvider
 
+        # Standard Azure (Public Cloud)
         auth = AzureProvider(
             client_id="your-client-id",
             client_secret="your-client-secret",
-            tenant_id="your-tenant-id",  # Required: your Azure tenant ID from Azure Portal
-            base_url="http://localhost:8000"
+            tenant_id="your-tenant-id",
+            required_scopes=["read", "write"],  # Unprefixed scope names
+            additional_authorize_scopes=["User.Read", "Mail.Read"],  # Optional Graph scopes
+            base_url="http://localhost:8000",
+            # identifier_uri defaults to api://{client_id}
+        )
+
+        # Azure Government
+        auth_gov = AzureProvider(
+            client_id="your-client-id",
+            client_secret="your-client-secret",
+            tenant_id="your-tenant-id",
+            required_scopes=["read", "write"],
+            base_authority="login.microsoftonline.us",  # Override for Azure Gov
+            base_url="http://localhost:8000",
         )
 
         mcp = FastMCP("My App", auth=auth)
@@ -152,109 +90,269 @@ class AzureProvider(OAuthProxy):
     def __init__(
         self,
         *,
-        client_id: str | NotSetT = NotSet,
-        client_secret: str | NotSetT = NotSet,
-        tenant_id: str | NotSetT = NotSet,
-        base_url: str | NotSetT = NotSet,
-        redirect_path: str | NotSetT = NotSet,
-        required_scopes: list[str] | None | NotSetT = NotSet,
-        timeout_seconds: int | NotSetT = NotSet,
-        allowed_client_redirect_uris: list[str] | NotSetT = NotSet,
-    ):
+        client_id: str,
+        client_secret: str,
+        tenant_id: str,
+        required_scopes: list[str],
+        base_url: str,
+        identifier_uri: str | None = None,
+        issuer_url: str | None = None,
+        redirect_path: str | None = None,
+        additional_authorize_scopes: list[str] | None = None,
+        allowed_client_redirect_uris: list[str] | None = None,
+        client_storage: AsyncKeyValue | None = None,
+        jwt_signing_key: str | bytes | None = None,
+        require_authorization_consent: bool = True,
+        base_authority: str = "login.microsoftonline.com",
+    ) -> None:
         """Initialize Azure OAuth provider.
 
         Args:
-            client_id: Azure application (client) ID
-            client_secret: Azure client secret
-            tenant_id: Azure tenant ID (your specific tenant ID, "organizations", or "consumers")
-            base_url: Public URL of your FastMCP server (for OAuth callbacks)
-            redirect_path: Redirect path configured in Azure (defaults to "/auth/callback")
-            required_scopes: Required scopes (defaults to ["User.Read", "email", "openid", "profile"])
-            timeout_seconds: HTTP request timeout for Azure API calls
+            client_id: Azure application (client) ID from your App registration
+            client_secret: Azure client secret from your App registration
+            tenant_id: Azure tenant ID (specific tenant GUID, "organizations", or "consumers")
+            identifier_uri: Optional Application ID URI for your custom API (defaults to api://{client_id}).
+                This URI is automatically prefixed to all required_scopes during initialization.
+                Example: identifier_uri="api://my-api" + required_scopes=["read"]
+                → tokens validated for "api://my-api/read"
+            base_url: Public URL where OAuth endpoints will be accessible (includes any mount path)
+            issuer_url: Issuer URL for OAuth metadata (defaults to base_url). Use root-level URL
+                to avoid 404s during discovery when mounting under a path.
+            redirect_path: Redirect path configured in Azure App registration (defaults to "/auth/callback")
+            base_authority: Azure authority base URL (defaults to "login.microsoftonline.com").
+                For Azure Government, use "login.microsoftonline.us".
+            required_scopes: Custom API scope names WITHOUT prefix (e.g., ["read", "write"]).
+                - Automatically prefixed with identifier_uri during initialization
+                - Validated on all tokens
+                - Advertised in Protected Resource Metadata
+                - Must match scope names defined in Azure Portal under "Expose an API"
+                Example: ["read", "write"] → validates tokens containing ["api://xxx/read", "api://xxx/write"]
+            additional_authorize_scopes: Microsoft Graph or other upstream scopes in full format.
+                - NOT prefixed with identifier_uri
+                - NOT validated on tokens
+                - NOT advertised to MCP clients
+                - Used to request additional permissions from Azure (e.g., Graph API access)
+                Example: ["User.Read", "Mail.Read", "offline_access"]
+                These scopes allow your FastMCP server to call Microsoft Graph APIs using the
+                upstream Azure token, but MCP clients are unaware of them.
             allowed_client_redirect_uris: List of allowed redirect URI patterns for MCP clients.
                 If None (default), all URIs are allowed. If empty list, no URIs are allowed.
+            client_storage: Storage backend for OAuth state (client registrations, encrypted tokens).
+                If None, a DiskStore will be created in the data directory (derived from `platformdirs`). The
+                disk store will be encrypted using a key derived from the JWT Signing Key.
+            jwt_signing_key: Secret for signing FastMCP JWT tokens (any string or bytes). If bytes are provided,
+                they will be used as is. If a string is provided, it will be derived into a 32-byte key. If not
+                provided, the upstream client secret will be used to derive a 32-byte key using PBKDF2.
+            require_authorization_consent: Whether to require user consent before authorizing clients (default True).
+                When True, users see a consent screen before being redirected to Azure.
+                When False, authorization proceeds directly without user confirmation.
+                SECURITY WARNING: Only disable for local development or testing environments.
         """
-        settings = AzureProviderSettings.model_validate(
-            {
-                k: v
-                for k, v in {
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "tenant_id": tenant_id,
-                    "base_url": base_url,
-                    "redirect_path": redirect_path,
-                    "required_scopes": required_scopes,
-                    "timeout_seconds": timeout_seconds,
-                    "allowed_client_redirect_uris": allowed_client_redirect_uris,
-                }.items()
-                if v is not NotSet
-            }
+        # Parse scopes if provided as string
+        parsed_required_scopes = parse_scopes(required_scopes)
+        parsed_additional_scopes = (
+            parse_scopes(additional_authorize_scopes)
+            if additional_authorize_scopes
+            else []
         )
-
-        # Validate required settings
-        if not settings.client_id:
-            raise ValueError(
-                "client_id is required - set via parameter or FASTMCP_SERVER_AUTH_AZURE_CLIENT_ID"
-            )
-        if not settings.client_secret:
-            raise ValueError(
-                "client_secret is required - set via parameter or FASTMCP_SERVER_AUTH_AZURE_CLIENT_SECRET"
-            )
-
-        # Validate tenant_id is provided
-        if not settings.tenant_id:
-            raise ValueError(
-                "tenant_id is required - set via parameter or FASTMCP_SERVER_AUTH_AZURE_TENANT_ID. "
-                "Use your Azure tenant ID (found in Azure Portal), 'organizations', or 'consumers'"
-            )
 
         # Apply defaults
-        tenant_id_final = settings.tenant_id
+        self.identifier_uri = identifier_uri or f"api://{client_id}"
+        self.additional_authorize_scopes = parsed_additional_scopes
 
-        timeout_seconds_final = settings.timeout_seconds or 10
-        # Default scopes for Azure - User.Read gives us access to user info via Graph API
-        scopes_final = settings.required_scopes or [
-            "User.Read",
-            "email",
-            "openid",
-            "profile",
-        ]
-        allowed_client_redirect_uris_final = settings.allowed_client_redirect_uris
+        # Always validate tokens against the app's API client ID using JWT
+        issuer = f"https://{base_authority}/{tenant_id}/v2.0"
+        jwks_uri = f"https://{base_authority}/{tenant_id}/discovery/v2.0/keys"
 
-        # Extract secret string from SecretStr
-        client_secret_str = (
-            settings.client_secret.get_secret_value() if settings.client_secret else ""
-        )
+        # Azure access tokens only include custom API scopes in the `scp` claim,
+        # NOT standard OIDC scopes (openid, profile, email, offline_access).
+        # Filter out OIDC scopes from validation - they'll still be sent to Azure
+        # during authorization (handled by _prefix_scopes_for_azure).
+        if parsed_required_scopes:
+            validation_scopes = [
+                s for s in parsed_required_scopes if s not in OIDC_SCOPES
+            ]
+            # If all scopes were OIDC scopes, use None (no scope validation)
+            if not validation_scopes:
+                validation_scopes = None
+        else:
+            validation_scopes = None
 
-        # Create Azure token verifier
-        token_verifier = AzureTokenVerifier(
-            required_scopes=scopes_final,
-            timeout_seconds=timeout_seconds_final,
+        token_verifier = JWTVerifier(
+            jwks_uri=jwks_uri,
+            issuer=issuer,
+            audience=client_id,
+            algorithm="RS256",
+            required_scopes=validation_scopes,  # Only validate non-OIDC scopes
         )
 
         # Build Azure OAuth endpoints with tenant
         authorization_endpoint = (
-            f"https://login.microsoftonline.com/{tenant_id_final}/oauth2/v2.0/authorize"
+            f"https://{base_authority}/{tenant_id}/oauth2/v2.0/authorize"
         )
-        token_endpoint = (
-            f"https://login.microsoftonline.com/{tenant_id_final}/oauth2/v2.0/token"
-        )
+        token_endpoint = f"https://{base_authority}/{tenant_id}/oauth2/v2.0/token"
 
         # Initialize OAuth proxy with Azure endpoints
         super().__init__(
             upstream_authorization_endpoint=authorization_endpoint,
             upstream_token_endpoint=token_endpoint,
-            upstream_client_id=settings.client_id,
-            upstream_client_secret=client_secret_str,
+            upstream_client_id=client_id,
+            upstream_client_secret=client_secret,
             token_verifier=token_verifier,
-            base_url=settings.base_url,
-            redirect_path=settings.redirect_path,
-            issuer_url=settings.base_url,
-            allowed_client_redirect_uris=allowed_client_redirect_uris_final,
+            base_url=base_url,
+            redirect_path=redirect_path,
+            issuer_url=issuer_url or base_url,  # Default to base_url if not specified
+            allowed_client_redirect_uris=allowed_client_redirect_uris,
+            client_storage=client_storage,
+            jwt_signing_key=jwt_signing_key,
+            require_authorization_consent=require_authorization_consent,
+            # Advertise full scopes including OIDC (even though we only validate non-OIDC)
+            valid_scopes=parsed_required_scopes,
         )
 
+        authority_info = ""
+        if base_authority != "login.microsoftonline.com":
+            authority_info = f" using authority {base_authority}"
         logger.info(
-            "Initialized Azure OAuth provider for client %s with tenant %s",
-            settings.client_id,
-            tenant_id_final,
+            "Initialized Azure OAuth provider for client %s with tenant %s%s%s",
+            client_id,
+            tenant_id,
+            f" and identifier_uri {self.identifier_uri}" if self.identifier_uri else "",
+            authority_info,
         )
+
+    async def authorize(
+        self,
+        client: OAuthClientInformationFull,
+        params: AuthorizationParams,
+    ) -> str:
+        """Start OAuth transaction and redirect to Azure AD.
+
+        Override parent's authorize method to filter out the 'resource' parameter
+        which is not supported by Azure AD v2.0 endpoints. The v2.0 endpoints use
+        scopes to determine the resource/audience instead of a separate parameter.
+
+        Args:
+            client: OAuth client information
+            params: Authorization parameters from the client
+
+        Returns:
+            Authorization URL to redirect the user to Azure AD
+        """
+        # Clear the resource parameter that Azure AD v2.0 doesn't support
+        # This parameter comes from RFC 8707 (OAuth 2.0 Resource Indicators)
+        # but Azure AD v2.0 uses scopes instead to determine the audience
+        params_to_use = params
+        if hasattr(params, "resource"):
+            original_resource = getattr(params, "resource", None)
+            if original_resource is not None:
+                params_to_use = params.model_copy(update={"resource": None})
+                if original_resource:
+                    logger.debug(
+                        "Filtering out 'resource' parameter '%s' for Azure AD v2.0 (use scopes instead)",
+                        original_resource,
+                    )
+        # Don't modify the scopes in params - they stay unprefixed for MCP clients
+        # We'll prefix them when building the Azure authorization URL (in _build_upstream_authorize_url)
+        auth_url = await super().authorize(client, params_to_use)
+        separator = "&" if "?" in auth_url else "?"
+        return f"{auth_url}{separator}prompt=select_account"
+
+    def _prefix_scopes_for_azure(self, scopes: list[str]) -> list[str]:
+        """Prefix unprefixed custom API scopes with identifier_uri for Azure.
+
+        This helper centralizes the scope prefixing logic used in both
+        authorization and token refresh flows.
+
+        Scopes that are NOT prefixed:
+        - Standard OIDC scopes (openid, profile, email, offline_access)
+        - Fully-qualified URIs (contain "://")
+        - Scopes with path component (contain "/")
+
+        Note: Microsoft Graph scopes (e.g., User.Read) should be passed via
+        `additional_authorize_scopes` or use fully-qualified format
+        (e.g., https://graph.microsoft.com/User.Read).
+
+        Args:
+            scopes: List of scopes, may be prefixed or unprefixed
+
+        Returns:
+            List of scopes with identifier_uri prefix applied where needed
+        """
+        prefixed = []
+        for scope in scopes:
+            if scope in OIDC_SCOPES:
+                # Standard OIDC scopes - never prefix
+                prefixed.append(scope)
+            elif "://" in scope or "/" in scope:
+                # Already fully-qualified (e.g., "api://xxx/read" or
+                # "https://graph.microsoft.com/User.Read")
+                prefixed.append(scope)
+            else:
+                # Unprefixed custom API scope - prefix with identifier_uri
+                prefixed.append(f"{self.identifier_uri}/{scope}")
+        return prefixed
+
+    def _build_upstream_authorize_url(
+        self, txn_id: str, transaction: dict[str, Any]
+    ) -> str:
+        """Build Azure authorization URL with prefixed scopes.
+
+        Overrides parent to prefix scopes with identifier_uri before sending to Azure,
+        while keeping unprefixed scopes in the transaction for MCP clients.
+        """
+        # Get unprefixed scopes from transaction
+        unprefixed_scopes = transaction.get("scopes") or self.required_scopes or []
+
+        # Prefix scopes for Azure authorization request
+        prefixed_scopes = self._prefix_scopes_for_azure(unprefixed_scopes)
+
+        # Add Microsoft Graph scopes (not validated, not prefixed)
+        if self.additional_authorize_scopes:
+            prefixed_scopes.extend(self.additional_authorize_scopes)
+
+        # Temporarily modify transaction dict for parent's URL building
+        modified_transaction = transaction.copy()
+        modified_transaction["scopes"] = prefixed_scopes
+
+        # Let parent build the URL with prefixed scopes
+        return super()._build_upstream_authorize_url(txn_id, modified_transaction)
+
+    def _prepare_scopes_for_upstream_refresh(self, scopes: list[str]) -> list[str]:
+        """Prepare scopes for Azure token refresh.
+
+        Azure requires:
+        1. Fully-qualified custom scopes (e.g., "api://xxx/read" not "read")
+        2. Microsoft Graph scopes (e.g., "User.Read", "openid") sent as-is
+        3. Additional scopes from provider config (additional_authorize_scopes)
+
+        This method transforms base client scopes for Azure while keeping them
+        unprefixed in storage to prevent accumulation.
+
+        Args:
+            scopes: Base scopes from RefreshToken (unprefixed, e.g., ["read"])
+
+        Returns:
+            Deduplicated list of scopes formatted for Azure token endpoint
+        """
+        logger.debug("Base scopes from storage: %s", scopes)
+
+        # Filter out any additional_authorize_scopes that may have been stored
+        # (they shouldn't be in storage, but clean them up if they are)
+        additional_scopes_set = set(self.additional_authorize_scopes or [])
+        base_scopes = [s for s in scopes if s not in additional_scopes_set]
+
+        # Prefix base scopes with identifier_uri for Azure using shared helper
+        prefixed_scopes = self._prefix_scopes_for_azure(base_scopes)
+
+        # Add additional scopes (Graph + OIDC) for the Azure request
+        # These are NOT stored in RefreshToken, only sent to Azure
+        if self.additional_authorize_scopes:
+            prefixed_scopes.extend(self.additional_authorize_scopes)
+
+        # Deduplicate while preserving order (in case older tokens have duplicates)
+        # Use dict.fromkeys() for O(n) deduplication with order preservation
+        deduplicated_scopes = list(dict.fromkeys(prefixed_scopes))
+
+        logger.debug("Scopes for Azure token endpoint: %s", deduplicated_scopes)
+        return deduplicated_scopes

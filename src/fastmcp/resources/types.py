@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import anyio
-import anyio.to_thread
 import httpx
 import pydantic.json
+from anyio import Path as AsyncPath
 from pydantic import Field, ValidationInfo
+from typing_extensions import override
 
 from fastmcp.exceptions import ResourceError
-from fastmcp.resources.resource import Resource
+from fastmcp.resources.resource import Resource, ResourceContent, ResourceResult
 from fastmcp.utilities.logging import get_logger
 
 logger = get_logger(__name__)
@@ -23,9 +23,11 @@ class TextResource(Resource):
 
     text: str = Field(description="Text content of the resource")
 
-    async def read(self) -> str:
+    async def read(self) -> ResourceResult:
         """Read the text content."""
-        return self.text
+        return ResourceResult(
+            contents=[ResourceContent(content=self.text, mime_type=self.mime_type)]
+        )
 
 
 class BinaryResource(Resource):
@@ -33,9 +35,11 @@ class BinaryResource(Resource):
 
     data: bytes = Field(description="Binary content of the resource")
 
-    async def read(self) -> bytes:
+    async def read(self) -> ResourceResult:
         """Read the binary content."""
-        return self.data
+        return ResourceResult(
+            contents=[ResourceContent(content=self.data, mime_type=self.mime_type)]
+        )
 
 
 class FileResource(Resource):
@@ -54,6 +58,10 @@ class FileResource(Resource):
         description="MIME type of the resource content",
     )
 
+    @property
+    def _async_path(self) -> AsyncPath:
+        return AsyncPath(self.path)
+
     @pydantic.field_validator("path")
     @classmethod
     def validate_absolute_path(cls, path: Path) -> Path:
@@ -71,12 +79,17 @@ class FileResource(Resource):
         mime_type = info.data.get("mime_type", "text/plain")
         return not mime_type.startswith("text/")
 
-    async def read(self) -> str | bytes:
+    @override
+    async def read(self) -> ResourceResult:
         """Read the file content."""
         try:
             if self.is_binary:
-                return await anyio.to_thread.run_sync(self.path.read_bytes)
-            return await anyio.to_thread.run_sync(self.path.read_text)
+                content: str | bytes = await self._async_path.read_bytes()
+            else:
+                content = await self._async_path.read_text()
+            return ResourceResult(
+                contents=[ResourceContent(content=content, mime_type=self.mime_type)]
+            )
         except Exception as e:
             raise ResourceError(f"Error reading file {self.path}") from e
 
@@ -89,12 +102,17 @@ class HttpResource(Resource):
         default="application/json", description="MIME type of the resource content"
     )
 
-    async def read(self) -> str | bytes:
+    @override
+    async def read(self) -> ResourceResult:
         """Read the HTTP content."""
         async with httpx.AsyncClient() as client:
             response = await client.get(self.url)
-            response.raise_for_status()
-            return response.text
+            _ = response.raise_for_status()
+            return ResourceResult(
+                contents=[
+                    ResourceContent(content=response.text, mime_type=self.mime_type)
+                ]
+            )
 
 
 class DirectoryResource(Resource):
@@ -111,6 +129,10 @@ class DirectoryResource(Resource):
         default="application/json", description="MIME type of the resource content"
     )
 
+    @property
+    def _async_path(self) -> AsyncPath:
+        return AsyncPath(self.path)
+
     @pydantic.field_validator("path")
     @classmethod
     def validate_absolute_path(cls, path: Path) -> Path:
@@ -119,33 +141,32 @@ class DirectoryResource(Resource):
             raise ValueError("Path must be absolute")
         return path
 
-    def list_files(self) -> list[Path]:
+    async def list_files(self) -> list[Path]:
         """List files in the directory."""
-        if not self.path.exists():
+        if not await self._async_path.exists():
             raise FileNotFoundError(f"Directory not found: {self.path}")
-        if not self.path.is_dir():
+        if not await self._async_path.is_dir():
             raise NotADirectoryError(f"Not a directory: {self.path}")
 
-        try:
-            if self.pattern:
-                return (
-                    list(self.path.glob(self.pattern))
-                    if not self.recursive
-                    else list(self.path.rglob(self.pattern))
-                )
-            return (
-                list(self.path.glob("*"))
-                if not self.recursive
-                else list(self.path.rglob("*"))
-            )
-        except Exception as e:
-            raise ResourceError(f"Error listing directory {self.path}: {e}")
+        pattern = self.pattern or "*"
 
-    async def read(self) -> str:  # Always returns JSON string
+        glob_fn = self._async_path.rglob if self.recursive else self._async_path.glob
+        try:
+            return [Path(p) async for p in glob_fn(pattern) if await p.is_file()]
+        except Exception as e:
+            raise ResourceError(f"Error listing directory {self.path}") from e
+
+    @override
+    async def read(self) -> ResourceResult:
         """Read the directory listing."""
         try:
-            files = await anyio.to_thread.run_sync(self.list_files)
-            file_list = [str(f.relative_to(self.path)) for f in files if f.is_file()]
-            return json.dumps({"files": file_list}, indent=2)
-        except Exception:
-            raise ResourceError(f"Error reading directory {self.path}")
+            files: list[Path] = await self.list_files()
+
+            file_list = [str(f.relative_to(self.path)) for f in files]
+
+            content = json.dumps({"files": file_list}, indent=2)
+            return ResourceResult(
+                contents=[ResourceContent(content=content, mime_type=self.mime_type)]
+            )
+        except Exception as e:
+            raise ResourceError(f"Error reading directory {self.path}") from e

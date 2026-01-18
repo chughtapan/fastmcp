@@ -51,9 +51,9 @@ def install_mcp_json(
         env_config = UVEnvironment(
             python=python_version,
             dependencies=(with_packages or []) + ["fastmcp"],
-            requirements=str(with_requirements) if with_requirements else None,
-            project=str(project) if project else None,
-            editable=[str(p) for p in with_editable] if with_editable else None,
+            requirements=with_requirements,
+            project=project,
+            editable=with_editable,
         )
         # Build server spec from parsed components
         if server_object:
@@ -110,15 +110,12 @@ async def mcp_json_command(
         cyclopts.Parameter(
             "--with-editable",
             help="Directory with pyproject.toml to install in editable mode (can be used multiple times)",
-            negative="",
         ),
     ] = None,
     with_packages: Annotated[
         list[str] | None,
         cyclopts.Parameter(
-            "--with",
-            help="Additional packages to install (can be used multiple times)",
-            negative="",
+            "--with", help="Additional packages to install (can be used multiple times)"
         ),
     ] = None,
     env_vars: Annotated[
@@ -126,7 +123,6 @@ async def mcp_json_command(
         cyclopts.Parameter(
             "--env",
             help="Environment variables in KEY=VALUE format (can be used multiple times)",
-            negative="",
         ),
     ] = None,
     env_file: Annotated[
@@ -141,7 +137,6 @@ async def mcp_json_command(
         cyclopts.Parameter(
             "--copy",
             help="Copy configuration to clipboard instead of printing to stdout",
-            negative="",
         ),
     ] = False,
     python: Annotated[

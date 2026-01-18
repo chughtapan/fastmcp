@@ -1,17 +1,21 @@
 import asyncio
+import contextlib
 import sys
-from typing import cast
-from unittest.mock import AsyncMock
+from collections.abc import AsyncIterator
+from typing import Any, cast
 
-import mcp
+import anyio
 import pytest
-from mcp import McpError
+from mcp import ClientSession, McpError
 from mcp.client.auth import OAuthClientProvider
+from mcp.types import TextContent
 from pydantic import AnyUrl
 
+import fastmcp
 from fastmcp.client import Client
 from fastmcp.client.auth.bearer import BearerAuth
 from fastmcp.client.transports import (
+    ClientTransport,
     FastMCPTransport,
     MCPConfigTransport,
     SSETransport,
@@ -46,15 +50,22 @@ def fastmcp_server():
         await asyncio.sleep(seconds)
         return f"Slept for {seconds} seconds"
 
-    # Add a resource
+    # Add a resource (return JSON string for proper typing)
     @server.resource(uri="data://users")
-    async def get_users():
-        return ["Alice", "Bob", "Charlie"]
+    async def get_users() -> str:
+        import json
 
-    # Add a resource template
+        return json.dumps(["Alice", "Bob", "Charlie"], separators=(",", ":"))
+
+    # Add a resource template (return JSON string for proper typing)
     @server.resource(uri="data://user/{user_id}")
-    async def get_user(user_id: str):
-        return {"id": user_id, "name": f"User {user_id}", "active": True}
+    async def get_user(user_id: str) -> str:
+        import json
+
+        return json.dumps(
+            {"id": user_id, "name": f"User {user_id}", "active": True},
+            separators=(",", ":"),
+        )
 
     # Add a prompt
     @server.prompt
@@ -68,14 +79,16 @@ def fastmcp_server():
 @pytest.fixture
 def tagged_resources_server():
     """Fixture that creates a FastMCP server with tagged resources and templates."""
+    import json
+
     server = FastMCP("TaggedResourcesServer")
 
     # Add a resource with tags
     @server.resource(
         uri="data://tagged", tags={"test", "metadata"}, description="A tagged resource"
     )
-    async def get_tagged_data():
-        return {"type": "tagged_data"}
+    async def get_tagged_data() -> str:
+        return json.dumps({"type": "tagged_data"}, separators=(",", ":"))
 
     # Add a resource template with tags
     @server.resource(
@@ -83,8 +96,8 @@ def tagged_resources_server():
         tags={"template", "parameterized"},
         description="A tagged template",
     )
-    async def get_template_data(id: str):
-        return {"id": id, "type": "template_data"}
+    async def get_template_data(id: str) -> str:
+        return json.dumps({"id": id, "type": "template_data"}, separators=(",", ":"))
 
     return server
 
@@ -121,7 +134,8 @@ async def test_call_tool(fastmcp_server):
     async with client:
         result = await client.call_tool("greet", {"name": "World"})
 
-        assert result.content[0].text == "Hello, World!"  # type: ignore[attr-defined]
+        assert isinstance(result.content[0], TextContent)
+        assert result.content[0].text == "Hello, World!"
         assert result.structured_content == {"result": "Hello, World!"}
         assert result.data == "Hello, World!"
         assert result.is_error is False
@@ -145,6 +159,47 @@ async def test_call_tool_mcp(fastmcp_server):
         first_content = content[0]
         content_str = str(first_content)
         assert "Hello, World!" in content_str
+
+
+async def test_call_tool_with_meta():
+    """Test that meta parameter is properly passed from client to server."""
+    server = FastMCP("MetaTestServer")
+
+    # Create a tool that accesses the meta from the request context
+    @server.tool
+    def check_meta() -> dict[str, Any]:
+        """A tool that returns the meta from the request context."""
+        from fastmcp.server.dependencies import get_context
+
+        context = get_context()
+        assert context.request_context is not None
+        meta = context.request_context.meta
+
+        # Return the meta data as a dict
+        if meta is not None:
+            return {
+                "has_meta": True,
+                "user_id": getattr(meta, "user_id", None),
+                "trace_id": getattr(meta, "trace_id", None),
+            }
+        return {"has_meta": False}
+
+    client = Client(transport=FastMCPTransport(server))
+
+    async with client:
+        # Test with meta parameter - verify the server receives it
+        test_meta = {"user_id": "test-123", "trace_id": "abc-def"}
+        result = await client.call_tool("check_meta", {}, meta=test_meta)
+
+        assert result.data["has_meta"] is True
+        assert result.data["user_id"] == "test-123"
+        assert result.data["trace_id"] == "abc-def"
+
+        # Test without meta parameter - verify fields are not present
+        result_no_meta = await client.call_tool("check_meta", {})
+        # When meta is not provided, custom fields should not be present
+        assert result_no_meta.data.get("user_id") is None
+        assert result_no_meta.data.get("trace_id") is None
 
 
 async def test_list_resources(fastmcp_server):
@@ -205,7 +260,8 @@ async def test_get_prompt(fastmcp_server):
         result = await client.get_prompt("welcome", {"name": "Developer"})
 
         # The result should contain our welcome message
-        assert result.messages[0].content.text == "Welcome to FastMCP, Developer!"  # type: ignore[attr-defined]
+        assert isinstance(result.messages[0].content, TextContent)
+        assert result.messages[0].content.text == "Welcome to FastMCP, Developer!"
         assert result.description == "Example greeting prompt."
 
 
@@ -217,7 +273,8 @@ async def test_get_prompt_mcp(fastmcp_server):
         result = await client.get_prompt_mcp("welcome", {"name": "Developer"})
 
         # The result should contain our welcome message
-        assert result.messages[0].content.text == "Welcome to FastMCP, Developer!"  # type: ignore[attr-defined]
+        assert isinstance(result.messages[0].content, TextContent)
+        assert result.messages[0].content.text == "Welcome to FastMCP, Developer!"
         assert result.description == "Example greeting prompt."
 
 
@@ -242,7 +299,8 @@ async def test_client_serializes_all_non_string_arguments():
             },
         )
 
-        content = result.messages[0].content.text  # type: ignore[attr-defined]
+        assert isinstance(result.messages[0].content, TextContent)
+        content = result.messages[0].content.text
         assert "arg1: hello" in content
         assert "arg2: [1,2,3]" in content  # JSON serialized list
         assert 'arg3: {"key":"value"}' in content  # JSON serialized dict
@@ -265,7 +323,8 @@ async def test_client_server_type_conversion_integration():
             {"numbers": [1, 2, 3, 4], "config": {"theme": "dark", "lang": "en"}},
         )
 
-        content = result.messages[0].content.text  # type: ignore[attr-defined]
+        assert isinstance(result.messages[0].content, TextContent)
+        content = result.messages[0].content.text
         assert "Got 4 numbers and 2 config items" in content
 
 
@@ -373,21 +432,21 @@ async def test_client_connection(fastmcp_server):
     assert not client.is_connected()
 
 
-async def test_initialize_called_once(fastmcp_server, monkeypatch):
-    mock_initialize = AsyncMock()
-    monkeypatch.setattr(mcp.ClientSession, "initialize", mock_initialize)
+async def test_initialize_called_once(fastmcp_server):
+    """Test that initialization is called once and sets initialize_result."""
     client = Client(transport=FastMCPTransport(fastmcp_server))
     async with client:
-        assert mock_initialize.call_count == 1
+        # Verify that initialization succeeded by checking initialize_result
+        assert client.initialize_result is not None
+        assert client.initialize_result.serverInfo is not None
 
 
 async def test_initialize_result_connected(fastmcp_server):
     """Test that initialize_result returns the correct result when connected."""
     client = Client(transport=FastMCPTransport(fastmcp_server))
 
-    # Initialize result should not be accessible before connection
-    with pytest.raises(RuntimeError, match="Client is not connected"):
-        _ = client.initialize_result
+    # Initialize result should be None before connection
+    assert client.initialize_result is None
 
     async with client:
         # Once connected, initialize_result should be available
@@ -400,21 +459,19 @@ async def test_initialize_result_connected(fastmcp_server):
 
 
 async def test_initialize_result_disconnected(fastmcp_server):
-    """Test that initialize_result raises an error when not connected."""
+    """Test that initialize_result is None when not connected."""
     client = Client(transport=FastMCPTransport(fastmcp_server))
 
-    # Initialize result should not be accessible before connection
-    with pytest.raises(RuntimeError, match="Client is not connected"):
-        _ = client.initialize_result
+    # Initialize result should be None before connection
+    assert client.initialize_result is None
 
     # Connect and then disconnect
     async with client:
         assert client.is_connected()
 
-    # After disconnection, initialize_result should raise an error
+    # After disconnection, initialize_result should be None again
     assert not client.is_connected()
-    with pytest.raises(RuntimeError, match="Client is not connected"):
-        _ = client.initialize_result
+    assert client.initialize_result is None
 
 
 async def test_server_info_custom_version():
@@ -425,6 +482,7 @@ async def test_server_info_custom_version():
 
     async with client:
         result = client.initialize_result
+        assert result is not None
         assert result.serverInfo.name == "CustomVersionServer"
         assert result.serverInfo.version == "1.2.3"
 
@@ -434,12 +492,34 @@ async def test_server_info_custom_version():
 
     async with client:
         result = client.initialize_result
+        assert result is not None
         assert result.serverInfo.name == "DefaultVersionServer"
-        # Should fall back to MCP library version
-        assert result.serverInfo.version is not None
-        assert (
-            result.serverInfo.version != "1.2.3"
-        )  # Should be different from custom version
+        # Should fall back to FastMCP version
+        assert result.serverInfo.version == fastmcp.__version__
+
+
+class _DelayedConnectTransport(ClientTransport):
+    def __init__(
+        self,
+        inner: ClientTransport,
+        connect_started: anyio.Event,
+        allow_connect: anyio.Event,
+    ) -> None:
+        self._inner = inner
+        self._connect_started = connect_started
+        self._allow_connect = allow_connect
+
+    @contextlib.asynccontextmanager
+    async def connect_session(
+        self, **session_kwargs: Any
+    ) -> AsyncIterator[ClientSession]:
+        self._connect_started.set()
+        await self._allow_connect.wait()
+        async with self._inner.connect_session(**session_kwargs) as session:
+            yield session
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 async def test_client_nested_context_manager(fastmcp_server):
@@ -457,12 +537,12 @@ async def test_client_nested_context_manager(fastmcp_server):
         assert client._session_state.session is not None
         session = client._session_state.session
 
-        # Re-use the same session
+        # Reuse the same session
         async with client:
             assert client.is_connected()
             assert client._session_state.session is session
 
-        # Re-use the same session
+        # Reuse the same session
         async with client:
             assert client.is_connected()
             assert client._session_state.session is session
@@ -470,6 +550,89 @@ async def test_client_nested_context_manager(fastmcp_server):
     # After connection
     assert not client.is_connected()
     assert client._session_state.session is None
+
+
+async def test_client_context_entry_cancelled_starter_cleans_up(fastmcp_server):
+    connect_started = anyio.Event()
+    allow_connect = anyio.Event()
+
+    client = Client(
+        transport=_DelayedConnectTransport(
+            FastMCPTransport(fastmcp_server),
+            connect_started=connect_started,
+            allow_connect=allow_connect,
+        )
+    )
+
+    async def enter_and_never_reach_body() -> None:
+        async with client:
+            pytest.fail(
+                "Context body should not be reached when __aenter__ is cancelled"
+            )
+
+    task = asyncio.create_task(enter_and_never_reach_body())
+    await connect_started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Connection startup was cancelled; session state should be fully reset.
+    assert client._session_state.session_task is None
+    assert client._session_state.session is None
+    assert client._session_state.nesting_counter == 0
+
+    # A future connection attempt should work normally.
+    allow_connect.set()
+    async with client:
+        tools = await client.list_tools()
+        assert len(tools) == 3
+
+
+async def test_cancelled_context_entry_waiter_does_not_close_active_session(
+    fastmcp_server,
+):
+    connect_started = anyio.Event()
+    allow_connect = anyio.Event()
+
+    client = Client(
+        transport=_DelayedConnectTransport(
+            FastMCPTransport(fastmcp_server),
+            connect_started=connect_started,
+            allow_connect=allow_connect,
+        )
+    )
+
+    b_done = asyncio.Event()
+    b_started = asyncio.Event()
+
+    async def task_a() -> int:
+        async with client:
+            await b_done.wait()
+            tools = await client.list_tools()
+            return len(tools)
+
+    async def task_b() -> None:
+        b_started.set()
+        async with client:
+            pytest.fail("This context should never be entered due to cancellation")
+
+    a = asyncio.create_task(task_a())
+    await connect_started.wait()
+
+    b = asyncio.create_task(task_b())
+    await b_started.wait()
+    await asyncio.sleep(0)  # let task_b attempt to acquire the client lock
+
+    b.cancel()
+    allow_connect.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await b
+
+    # task_b is fully cancelled; allow task_a to exercise the connected session.
+    b_done.set()
+    assert await a == 3
 
 
 async def test_concurrent_client_context_managers():
@@ -652,8 +815,9 @@ class TestErrorHandling:
         async with client:
             result = await client.call_tool_mcp("error_tool", {})
             assert result.isError
-            assert "test error" in result.content[0].text  # type: ignore[attr-defined]
-            assert "abc" in result.content[0].text  # type: ignore[attr-defined]
+            assert isinstance(result.content[0], TextContent)
+            assert "test error" in result.content[0].text
+            assert "abc" in result.content[0].text
 
     async def test_general_tool_exceptions_are_masked_when_enabled(self):
         mcp = FastMCP("TestServer", mask_error_details=True)
@@ -667,8 +831,9 @@ class TestErrorHandling:
         async with client:
             result = await client.call_tool_mcp("error_tool", {})
             assert result.isError
-            assert "test error" not in result.content[0].text  # type: ignore[attr-defined]
-            assert "abc" not in result.content[0].text  # type: ignore[attr-defined]
+            assert isinstance(result.content[0], TextContent)
+            assert "test error" not in result.content[0].text
+            assert "abc" not in result.content[0].text
 
     async def test_validation_errors_are_not_masked_when_enabled(self):
         mcp = FastMCP("TestServer", mask_error_details=True)
@@ -680,7 +845,9 @@ class TestErrorHandling:
         async with Client(transport=FastMCPTransport(mcp)) as client:
             result = await client.call_tool_mcp("validated_tool", {"x": "abc"})
             assert result.isError
-            assert "'abc' is not of type 'integer'" in result.content[0].text  # type: ignore[attr-defined]
+            # Pydantic validation error message should NOT be masked
+            assert isinstance(result.content[0], TextContent)
+            assert "Input should be a valid integer" in result.content[0].text
 
     async def test_specific_tool_errors_are_sent_to_client(self):
         mcp = FastMCP("TestServer")
@@ -694,8 +861,9 @@ class TestErrorHandling:
         async with client:
             result = await client.call_tool_mcp("custom_error_tool", {})
             assert result.isError
-            assert "test error" in result.content[0].text  # type: ignore[attr-defined]
-            assert "abc" in result.content[0].text  # type: ignore[attr-defined]
+            assert isinstance(result.content[0], TextContent)
+            assert "test error" in result.content[0].text
+            assert "abc" in result.content[0].text
 
     async def test_general_resource_exceptions_are_not_masked_by_default(self):
         mcp = FastMCP("TestServer")
@@ -942,13 +1110,8 @@ class TestInferTransport:
         }
         transport = infer_transport(config)
         assert isinstance(transport, MCPConfigTransport)
-        assert isinstance(transport.transport, FastMCPTransport)
-        assert (
-            len(
-                cast(FastMCP, transport.transport.server)._tool_manager._mounted_servers
-            )
-            == 2
-        )
+        # Multi-server configs create composite server at connect time
+        assert len(transport.config.mcpServers) == 2
 
     def test_infer_fastmcp_server(self, fastmcp_server):
         """FastMCP server instances should infer to FastMCPTransport."""
@@ -1032,3 +1195,244 @@ class TestAuth:
         assert isinstance(client.transport, SSETransport)
         assert isinstance(client.transport.auth, BearerAuth)
         assert client.transport.auth.token.get_secret_value() == "test_token"
+
+
+class TestInitialize:
+    """Tests for client initialization behavior."""
+
+    async def test_auto_initialize_default(self, fastmcp_server):
+        """Test that auto_initialize=True is the default and works automatically."""
+        client = Client(fastmcp_server)
+
+        async with client:
+            # Should be automatically initialized
+            assert client.initialize_result is not None
+            assert client.initialize_result.serverInfo.name == "TestServer"
+            assert client.initialize_result.instructions is None
+
+    async def test_auto_initialize_explicit_true(self, fastmcp_server):
+        """Test explicit auto_initialize=True."""
+        client = Client(fastmcp_server, auto_initialize=True)
+
+        async with client:
+            assert client.initialize_result is not None
+            assert client.initialize_result.serverInfo.name == "TestServer"
+
+    async def test_auto_initialize_false(self, fastmcp_server):
+        """Test that auto_initialize=False prevents automatic initialization."""
+        client = Client(fastmcp_server, auto_initialize=False)
+
+        async with client:
+            # Should not be automatically initialized
+            assert client.initialize_result is None
+
+    async def test_manual_initialize(self, fastmcp_server):
+        """Test manual initialization when auto_initialize=False."""
+        client = Client(fastmcp_server, auto_initialize=False)
+
+        async with client:
+            # Manually initialize
+            result = await client.initialize()
+
+            assert result is not None
+            assert result.serverInfo.name == "TestServer"
+            assert client.initialize_result is result
+
+    async def test_initialize_idempotent(self, fastmcp_server):
+        """Test that calling initialize() multiple times returns cached result."""
+        client = Client(fastmcp_server, auto_initialize=False)
+
+        async with client:
+            result1 = await client.initialize()
+            result2 = await client.initialize()
+            result3 = await client.initialize()
+
+            # All should return the same cached result
+            assert result1 is result2
+            assert result2 is result3
+
+    async def test_initialize_with_instructions(self):
+        """Test that server instructions are available via initialize_result."""
+        server = FastMCP("InstructionsServer", instructions="Use the greet tool!")
+
+        @server.tool
+        def greet(name: str) -> str:
+            return f"Hello, {name}!"
+
+        client = Client(server)
+
+        async with client:
+            result = client.initialize_result
+            assert result is not None
+            assert result.instructions == "Use the greet tool!"
+
+    async def test_initialize_timeout_custom(self, fastmcp_server):
+        """Test custom timeout for initialize()."""
+        client = Client(fastmcp_server, auto_initialize=False)
+
+        async with client:
+            # Should succeed with reasonable timeout
+            result = await client.initialize(timeout=5.0)
+            assert result is not None
+
+    async def test_initialize_property_after_auto_init(self, fastmcp_server):
+        """Test accessing initialize_result property after auto-initialization."""
+        client = Client(fastmcp_server, auto_initialize=True)
+
+        async with client:
+            # Access via property
+            result = client.initialize_result
+            assert result is not None
+            assert result.serverInfo.name == "TestServer"
+
+            # Call method - should return cached
+            result2 = await client.initialize()
+            assert result is result2
+
+    async def test_initialize_property_before_connect(self, fastmcp_server):
+        """Test that initialize_result property is None before connection."""
+        client = Client(fastmcp_server)
+
+        # Not yet connected
+        assert client.initialize_result is None
+
+    async def test_manual_initialize_can_call_tools(self, fastmcp_server):
+        """Test that manually initialized client can call tools."""
+        client = Client(fastmcp_server, auto_initialize=False)
+
+        async with client:
+            await client.initialize()
+
+            # Should be able to call tools after manual initialization
+            result = await client.call_tool("greet", {"name": "World"})
+            assert "Hello, World!" in str(result.content)
+
+
+class TestSessionTaskErrorPropagation:
+    """Tests for ensuring session task errors propagate to client calls.
+
+    Regression tests for https://github.com/jlowin/fastmcp/issues/2595
+    where the client would hang indefinitely when the session task failed
+    (e.g., due to HTTP 4xx/5xx errors) instead of raising an exception.
+    """
+
+    async def test_session_task_error_propagates_to_call(self, fastmcp_server):
+        """Test that errors in session task propagate to pending client calls.
+
+        When the session task fails (e.g., due to HTTP errors), pending
+        client operations should immediately receive the exception rather
+        than hanging indefinitely.
+        """
+        client = Client(fastmcp_server)
+
+        async with client:
+            original_task = client._session_state.session_task
+            assert original_task is not None
+
+            async def never_complete():
+                """A coroutine that will never complete normally."""
+                await asyncio.sleep(1000)
+
+            async def failing_session():
+                """Simulates a session task that raises an error."""
+                raise ValueError("Simulated HTTP error")
+
+            # Replace session_task with one that will fail
+            client._session_state.session_task = asyncio.create_task(failing_session())
+
+            # The monitoring should detect the session task failure
+            with pytest.raises(ValueError, match="Simulated HTTP error"):
+                await client._await_with_session_monitoring(never_complete())
+
+            # Restore original task for cleanup
+            client._session_state.session_task = original_task
+
+    async def test_session_task_already_done_with_error(self, fastmcp_server):
+        """Test that if session task is already done with error, calls fail immediately."""
+        client = Client(fastmcp_server)
+
+        async with client:
+            original_task = client._session_state.session_task
+
+            async def raise_error():
+                raise ValueError("Session failed")
+
+            # Replace session_task with one that has already failed
+            failed_task = asyncio.create_task(raise_error())
+            try:
+                await failed_task
+            except ValueError:
+                pass  # Expected
+            client._session_state.session_task = failed_task
+
+            # New calls should fail immediately with the original error
+            async def simple_coro():
+                return "should not reach"
+
+            with pytest.raises(ValueError, match="Session failed"):
+                await client._await_with_session_monitoring(simple_coro())
+
+            # Restore original task for cleanup
+            client._session_state.session_task = original_task
+
+    async def test_session_task_already_done_no_error_raises_runtime_error(
+        self, fastmcp_server
+    ):
+        """Test that if session task completes without error, raises RuntimeError."""
+        client = Client(fastmcp_server)
+
+        async with client:
+            original_task = client._session_state.session_task
+
+            # Create a task that completes normally (unexpected for session task)
+            completed_task = asyncio.create_task(asyncio.sleep(0))
+            await completed_task
+            client._session_state.session_task = completed_task
+
+            async def simple_coro():
+                return "should not reach"
+
+            with pytest.raises(
+                RuntimeError, match="Session task completed unexpectedly"
+            ):
+                await client._await_with_session_monitoring(simple_coro())
+
+            # Restore original task for cleanup
+            client._session_state.session_task = original_task
+
+    async def test_normal_operation_unaffected(self, fastmcp_server):
+        """Test that normal operation is unaffected by the monitoring."""
+        client = Client(fastmcp_server)
+
+        async with client:
+            # These should all work normally
+            tools = await client.list_tools()
+            assert len(tools) > 0
+
+            result = await client.call_tool("greet", {"name": "Test"})
+            assert "Hello, Test!" in str(result.content)
+
+            resources = await client.list_resources()
+            assert len(resources) > 0
+
+            prompts = await client.list_prompts()
+            assert len(prompts) > 0
+
+    async def test_no_session_task_falls_back_to_direct_await(self, fastmcp_server):
+        """Test that when no session task exists, it falls back to direct await."""
+        client = Client(fastmcp_server)
+
+        async with client:
+            # Temporarily remove session_task to test fallback
+            original_task = client._session_state.session_task
+            client._session_state.session_task = None
+
+            # Should work via direct await
+            async def simple_coro():
+                return "success"
+
+            result = await client._await_with_session_monitoring(simple_coro())
+            assert result == "success"
+
+            # Restore for cleanup
+            client._session_state.session_task = original_task

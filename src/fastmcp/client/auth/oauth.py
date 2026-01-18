@@ -1,30 +1,29 @@
 from __future__ import annotations
 
-import asyncio
-import json
+import time
 import webbrowser
-from asyncio import Future
 from collections.abc import AsyncGenerator
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Literal
-from urllib.parse import urlparse
+from contextlib import aclosing
+from typing import Any
 
 import anyio
 import httpx
+from key_value.aio.adapters.pydantic import PydanticAdapter
+from key_value.aio.protocols import AsyncKeyValue
+from key_value.aio.stores.memory import MemoryStore
 from mcp.client.auth import OAuthClientProvider, TokenStorage
+from mcp.shared._httpx_utils import McpHttpClientFactory
 from mcp.shared.auth import (
     OAuthClientInformationFull,
     OAuthClientMetadata,
+    OAuthToken,
 )
-from mcp.shared.auth import (
-    OAuthToken as OAuthToken,
-)
-from pydantic import AnyHttpUrl, BaseModel, TypeAdapter, ValidationError
+from pydantic import AnyHttpUrl
+from typing_extensions import override
 from uvicorn.server import Server
 
-from fastmcp import settings as fastmcp_global_settings
 from fastmcp.client.oauth_callback import (
+    OAuthCallbackResult,
     create_oauth_callback_server,
 )
 from fastmcp.utilities.http import find_available_port
@@ -37,163 +36,6 @@ logger = get_logger(__name__)
 
 class ClientNotFoundError(Exception):
     """Raised when OAuth client credentials are not found on the server."""
-
-    pass
-
-
-class StoredToken(BaseModel):
-    """Token storage format with absolute expiry time."""
-
-    token_payload: OAuthToken
-    expires_at: datetime | None
-
-
-# Create TypeAdapter at module level for efficient parsing
-stored_token_adapter = TypeAdapter(StoredToken)
-
-
-def default_cache_dir() -> Path:
-    return fastmcp_global_settings.home / "oauth-mcp-client-cache"
-
-
-class FileTokenStorage(TokenStorage):
-    """
-    File-based token storage implementation for OAuth credentials and tokens.
-    Implements the mcp.client.auth.TokenStorage protocol.
-
-    Each instance is tied to a specific server URL for proper token isolation.
-    """
-
-    def __init__(self, server_url: str, cache_dir: Path | None = None):
-        """Initialize storage for a specific server URL."""
-        self.server_url = server_url
-        self.cache_dir = cache_dir or default_cache_dir()
-        self.cache_dir.mkdir(exist_ok=True, parents=True)
-
-    @staticmethod
-    def get_base_url(url: str) -> str:
-        """Extract the base URL (scheme + host) from a URL."""
-        parsed = urlparse(url)
-        return f"{parsed.scheme}://{parsed.netloc}"
-
-    def get_cache_key(self) -> str:
-        """Generate a safe filesystem key from the server's base URL."""
-        base_url = self.get_base_url(self.server_url)
-        return (
-            base_url.replace("://", "_")
-            .replace(".", "_")
-            .replace("/", "_")
-            .replace(":", "_")
-        )
-
-    def _get_file_path(self, file_type: Literal["client_info", "tokens"]) -> Path:
-        """Get the file path for the specified cache file type."""
-        key = self.get_cache_key()
-        return self.cache_dir / f"{key}_{file_type}.json"
-
-    async def get_tokens(self) -> OAuthToken | None:
-        """Load tokens from file storage."""
-        path = self._get_file_path("tokens")
-
-        try:
-            # Parse JSON and validate as StoredToken
-            stored = stored_token_adapter.validate_json(path.read_text())
-
-            # Check if token is expired
-            if stored.expires_at is not None:
-                now = datetime.now(timezone.utc)
-                if now >= stored.expires_at:
-                    logger.debug(
-                        f"Token expired for {self.get_base_url(self.server_url)}"
-                    )
-                    return None
-
-                # Recalculate expires_in to be correct relative to now
-                if stored.token_payload.expires_in is not None:
-                    remaining = stored.expires_at - now
-                    stored.token_payload.expires_in = max(
-                        0, int(remaining.total_seconds())
-                    )
-
-            return stored.token_payload
-
-        except (FileNotFoundError, ValidationError) as e:
-            logger.debug(
-                f"Could not load tokens for {self.get_base_url(self.server_url)}: {e}"
-            )
-            return None
-
-    async def set_tokens(self, tokens: OAuthToken) -> None:
-        """Save tokens to file storage."""
-        path = self._get_file_path("tokens")
-
-        # Calculate absolute expiry time if expires_in is present
-        expires_at = None
-        if tokens.expires_in is not None:
-            expires_at = datetime.now(timezone.utc) + timedelta(
-                seconds=tokens.expires_in
-            )
-
-        # Create StoredToken and save using Pydantic serialization
-        stored = StoredToken(token_payload=tokens, expires_at=expires_at)
-
-        path.write_text(stored.model_dump_json(indent=2))
-        logger.debug(f"Saved tokens for {self.get_base_url(self.server_url)}")
-
-    async def get_client_info(self) -> OAuthClientInformationFull | None:
-        """Load client information from file storage."""
-        path = self._get_file_path("client_info")
-        try:
-            client_info = OAuthClientInformationFull.model_validate_json(
-                path.read_text()
-            )
-            # Check if we have corresponding valid tokens
-            # If no tokens exist, the OAuth flow was incomplete and we should
-            # force a fresh client registration
-            tokens = await self.get_tokens()
-            if tokens is None:
-                logger.debug(
-                    f"No tokens found for client info at {self.get_base_url(self.server_url)}. "
-                    "OAuth flow may have been incomplete. Clearing client info to force fresh registration."
-                )
-                # Clear the incomplete client info
-                client_info_path = self._get_file_path("client_info")
-                client_info_path.unlink(missing_ok=True)
-                return None
-
-            return client_info
-        except (FileNotFoundError, json.JSONDecodeError, ValidationError) as e:
-            logger.debug(
-                f"Could not load client info for {self.get_base_url(self.server_url)}: {e}"
-            )
-            return None
-
-    async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
-        """Save client information to file storage."""
-        path = self._get_file_path("client_info")
-        path.write_text(client_info.model_dump_json(indent=2))
-        logger.debug(f"Saved client info for {self.get_base_url(self.server_url)}")
-
-    def clear(self) -> None:
-        """Clear all cached data for this server."""
-        file_types: list[Literal["client_info", "tokens"]] = ["client_info", "tokens"]
-        for file_type in file_types:
-            path = self._get_file_path(file_type)
-            path.unlink(missing_ok=True)
-        logger.debug(f"Cleared OAuth cache for {self.get_base_url(self.server_url)}")
-
-    @classmethod
-    def clear_all(cls, cache_dir: Path | None = None) -> None:
-        """Clear all cached data for all servers."""
-        cache_dir = cache_dir or default_cache_dir()
-        if not cache_dir.exists():
-            return
-
-        file_types: list[Literal["client_info", "tokens"]] = ["client_info", "tokens"]
-        for file_type in file_types:
-            for file in cache_dir.glob(f"*_{file_type}.json"):
-                file.unlink(missing_ok=True)
-        logger.info("Cleared all OAuth client cache data.")
 
 
 async def check_if_auth_required(
@@ -215,7 +57,7 @@ async def check_if_auth_required(
                 return True
 
             # Check for WWW-Authenticate header
-            if "WWW-Authenticate" in response.headers:
+            if "WWW-Authenticate" in response.headers:  # noqa: SIM103
                 return True
 
             # If we get a successful response, auth may not be required
@@ -224,6 +66,73 @@ async def check_if_auth_required(
         except httpx.RequestError:
             # If we can't connect, assume auth might be required
             return True
+
+
+class TokenStorageAdapter(TokenStorage):
+    _server_url: str
+    _key_value_store: AsyncKeyValue
+    _storage_oauth_token: PydanticAdapter[OAuthToken]
+    _storage_client_info: PydanticAdapter[OAuthClientInformationFull]
+
+    def __init__(self, async_key_value: AsyncKeyValue, server_url: str):
+        self._server_url = server_url
+        self._key_value_store = async_key_value
+        self._storage_oauth_token = PydanticAdapter[OAuthToken](
+            default_collection="mcp-oauth-token",
+            key_value=async_key_value,
+            pydantic_model=OAuthToken,
+            raise_on_validation_error=True,
+        )
+        self._storage_client_info = PydanticAdapter[OAuthClientInformationFull](
+            default_collection="mcp-oauth-client-info",
+            key_value=async_key_value,
+            pydantic_model=OAuthClientInformationFull,
+            raise_on_validation_error=True,
+        )
+
+    def _get_token_cache_key(self) -> str:
+        return f"{self._server_url}/tokens"
+
+    def _get_client_info_cache_key(self) -> str:
+        return f"{self._server_url}/client_info"
+
+    async def clear(self) -> None:
+        await self._storage_oauth_token.delete(key=self._get_token_cache_key())
+        await self._storage_client_info.delete(key=self._get_client_info_cache_key())
+
+    @override
+    async def get_tokens(self) -> OAuthToken | None:
+        return await self._storage_oauth_token.get(key=self._get_token_cache_key())
+
+    @override
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        # Don't set TTL based on access token expiry - the refresh token may be
+        # valid much longer. Use 1 year as a reasonable upper bound; the OAuth
+        # provider handles actual token expiry/refresh logic.
+        await self._storage_oauth_token.put(
+            key=self._get_token_cache_key(),
+            value=tokens,
+            ttl=60 * 60 * 24 * 365,  # 1 year
+        )
+
+    @override
+    async def get_client_info(self) -> OAuthClientInformationFull | None:
+        return await self._storage_client_info.get(
+            key=self._get_client_info_cache_key()
+        )
+
+    @override
+    async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
+        ttl: int | None = None
+
+        if client_info.client_secret_expires_at:
+            ttl = client_info.client_secret_expires_at - int(time.time())
+
+        await self._storage_client_info.put(
+            key=self._get_client_info_cache_key(),
+            value=client_info,
+            ttl=ttl,
+        )
 
 
 class OAuth(OAuthClientProvider):
@@ -239,9 +148,10 @@ class OAuth(OAuthClientProvider):
         mcp_url: str,
         scopes: str | list[str] | None = None,
         client_name: str = "FastMCP Client",
-        token_storage_cache_dir: Path | None = None,
+        token_storage: AsyncKeyValue | None = None,
         additional_client_metadata: dict[str, Any] | None = None,
         callback_port: int | None = None,
+        httpx_client_factory: McpHttpClientFactory | None = None,
     ):
         """
         Initialize OAuth client provider for an MCP server.
@@ -251,14 +161,15 @@ class OAuth(OAuthClientProvider):
             scopes: OAuth scopes to request. Can be a
             space-separated string or a list of strings.
             client_name: Name for this client during registration
-            token_storage_cache_dir: Directory for FileTokenStorage
+            token_storage: An AsyncKeyValue-compatible token store, tokens are stored in memory if not provided
             additional_client_metadata: Extra fields for OAuthClientMetadata
             callback_port: Fixed port for OAuth callback (default: random available port)
         """
-        parsed_url = urlparse(mcp_url)
-        server_base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        # Normalize the MCP URL (strip trailing slashes for consistency)
+        mcp_url = mcp_url.rstrip("/")
 
         # Setup OAuth client
+        self.httpx_client_factory = httpx_client_factory or httpx.AsyncClient
         self.redirect_port = callback_port or find_available_port()
         redirect_uri = f"http://localhost:{self.redirect_port}/callback"
 
@@ -281,18 +192,31 @@ class OAuth(OAuthClientProvider):
         )
 
         # Create server-specific token storage
-        storage = FileTokenStorage(
-            server_url=server_base_url, cache_dir=token_storage_cache_dir
+        token_storage = token_storage or MemoryStore()
+
+        if isinstance(token_storage, MemoryStore):
+            from warnings import warn
+
+            warn(
+                message="Using in-memory token storage -- tokens will be lost when the client restarts. "
+                + "For persistent storage across multiple MCP servers, provide an encrypted AsyncKeyValue backend. "
+                + "See https://gofastmcp.com/clients/auth/oauth#token-storage for details.",
+                stacklevel=2,
+            )
+
+        # Use full URL for token storage to properly separate tokens per MCP endpoint
+        self.token_storage_adapter: TokenStorageAdapter = TokenStorageAdapter(
+            async_key_value=token_storage, server_url=mcp_url
         )
 
-        # Store server_base_url for use in callback_handler
-        self.server_base_url = server_base_url
+        # Store full MCP URL for use in callback_handler display
+        self.mcp_url = mcp_url
 
-        # Initialize parent class
+        # Initialize parent class with full URL for proper OAuth metadata discovery
         super().__init__(
-            server_url=server_base_url,
+            server_url=mcp_url,
             client_metadata=client_metadata,
-            storage=storage,
+            storage=self.token_storage_adapter,
             redirect_handler=self.redirect_handler,
             callback_handler=self.callback_handler,
         )
@@ -309,7 +233,7 @@ class OAuth(OAuthClientProvider):
     async def redirect_handler(self, authorization_url: str) -> None:
         """Open browser for authorization, with pre-flight check for invalid client."""
         # Pre-flight check to detect invalid client_id before opening browser
-        async with httpx.AsyncClient() as client:
+        async with self.httpx_client_factory() as client:
             response = await client.get(authorization_url, follow_redirects=False)
 
             # Check for client not found error (400 typically means bad client_id)
@@ -318,8 +242,8 @@ class OAuth(OAuthClientProvider):
                     "OAuth client not found - cached credentials may be stale"
                 )
 
-            # For any non-redirect response, something is wrong
-            if response.status_code not in (302, 303, 307, 308):
+            # OAuth typically returns redirects, but some providers return 200 with HTML login pages
+            if response.status_code not in (200, 302, 303, 307, 308):
                 raise RuntimeError(
                     f"Unexpected authorization response: {response.status_code}"
                 )
@@ -329,14 +253,16 @@ class OAuth(OAuthClientProvider):
 
     async def callback_handler(self) -> tuple[str, str | None]:
         """Handle OAuth callback and return (auth_code, state)."""
-        # Create a future to capture the OAuth response
-        response_future: Future[Any] = asyncio.get_running_loop().create_future()
+        # Create result container and event to capture the OAuth response
+        result = OAuthCallbackResult()
+        result_ready = anyio.Event()
 
-        # Create server with the future
+        # Create server with result tracking
         server: Server = create_oauth_callback_server(
             port=self.redirect_port,
-            server_url=self.server_base_url,
-            response_future=response_future,
+            server_url=self.mcp_url,
+            result_container=result,
+            result_ready=result_ready,
         )
 
         # Run server until response is received with timeout logic
@@ -349,13 +275,17 @@ class OAuth(OAuthClientProvider):
             TIMEOUT = 300.0  # 5 minute timeout
             try:
                 with anyio.fail_after(TIMEOUT):
-                    auth_code, state = await response_future
-                    return auth_code, state
-            except TimeoutError:
-                raise TimeoutError(f"OAuth callback timed out after {TIMEOUT} seconds")
+                    await result_ready.wait()
+                    if result.error:
+                        raise result.error
+                    return result.code, result.state  # type: ignore
+            except TimeoutError as e:
+                raise TimeoutError(
+                    f"OAuth callback timed out after {TIMEOUT} seconds"
+                ) from e
             finally:
                 server.should_exit = True
-                await asyncio.sleep(0.1)  # Allow server to shut down gracefully
+                await anyio.sleep(0.1)  # Allow server to shut down gracefully
                 tg.cancel_scope.cancel()
 
         raise RuntimeError("OAuth callback handler could not be started")
@@ -370,45 +300,30 @@ class OAuth(OAuthClientProvider):
         """
         try:
             # First attempt with potentially cached credentials
-            gen = super().async_auth_flow(request)
-            response = None
-            while True:
-                try:
-                    yielded_request = await gen.asend(response)
-                    response = yield yielded_request
-                except StopAsyncIteration:
-                    break
+            async with aclosing(super().async_auth_flow(request)) as gen:
+                response = None
+                while True:
+                    try:
+                        # First iteration sends None, subsequent iterations send response
+                        yielded_request = await gen.asend(response)  # ty: ignore[invalid-argument-type]
+                        response = yield yielded_request
+                    except StopAsyncIteration:
+                        break
 
         except ClientNotFoundError:
             logger.debug(
                 "OAuth client not found on server, clearing cache and retrying..."
             )
-
             # Clear cached state and retry once
             self._initialized = False
+            await self.token_storage_adapter.clear()
 
-            # Try to clear storage if it supports it
-            if hasattr(self.context.storage, "clear"):
-                try:
-                    self.context.storage.clear()
-                except Exception as e:
-                    logger.warning(f"Failed to clear OAuth storage cache: {e}")
-                    # Can't retry without clearing cache, re-raise original error
-                    raise ClientNotFoundError(
-                        "OAuth client not found and cache could not be cleared"
-                    ) from e
-            else:
-                logger.warning(
-                    "Storage does not support clear() - cannot retry with fresh credentials"
-                )
-                # Can't retry without clearing cache, re-raise original error
-                raise
-
-            gen = super().async_auth_flow(request)
-            response = None
-            while True:
-                try:
-                    yielded_request = await gen.asend(response)
-                    response = yield yielded_request
-                except StopAsyncIteration:
-                    break
+            # Retry with fresh registration
+            async with aclosing(super().async_auth_flow(request)) as gen:
+                response = None
+                while True:
+                    try:
+                        yielded_request = await gen.asend(response)  # ty: ignore[invalid-argument-type]
+                        response = yield yielded_request
+                    except StopAsyncIteration:
+                        break

@@ -8,35 +8,73 @@ import { VersionBadge } from '/snippets/version-badge.mdx'
 
 When defining FastMCP [tools](/servers/tools), [resources](/servers/resources), resource templates, or [prompts](/servers/prompts), your functions might need to interact with the underlying MCP session or access advanced server capabilities. FastMCP provides the `Context` object for this purpose.
 
+<Note>
+FastMCP uses [Docket](https://github.com/chrisguidry/docket)'s dependency injection system for managing runtime dependencies. This page covers Context and the built-in dependencies; see [Custom Dependencies](#custom-dependencies) for creating your own.
+</Note>
+
 ## What Is Context?
 
 The `Context` object provides a clean interface to access MCP features within your functions, including:
 
 - **Logging**: Send debug, info, warning, and error messages back to the client
 - **Progress Reporting**: Update the client on the progress of long-running operations
-- **Resource Access**: Read data from resources registered with the server
+- **Resource Access**: List and read data from resources registered with the server
+- **Prompt Access**: List and retrieve prompts registered with the server
 - **LLM Sampling**: Request the client's LLM to generate text based on provided messages
 - **User Elicitation**: Request structured input from users during tool execution
-- **State Management**: Store and share data across middleware and tool calls within a request
+- **Session State**: Store data that persists across requests within an MCP session
 - **Request Information**: Access metadata about the current request
 - **Server Access**: When needed, access the underlying FastMCP server instance
 
 ## Accessing the Context
 
-### Via Dependency Injection
+<VersionBadge version="2.14" />
 
-To use the context object within any of your functions, simply add a parameter to your function signature and type-hint it as `Context`. FastMCP will automatically inject the context instance when your function is called.
+The preferred way to access context is using the `CurrentContext()` dependency:
+
+```python {1, 6}
+from fastmcp import FastMCP
+from fastmcp.dependencies import CurrentContext
+from fastmcp.server.context import Context
+
+mcp = FastMCP(name="Context Demo")
+
+@mcp.tool
+async def process_file(file_uri: str, ctx: Context = CurrentContext()) -> str:
+    """Processes a file, using context for logging and resource access."""
+    await ctx.info(f"Processing {file_uri}")
+    return "Processed file"
+```
+
+This works with tools, resources, and prompts:
+
+```python
+from fastmcp import FastMCP
+from fastmcp.dependencies import CurrentContext
+from fastmcp.server.context import Context
+
+mcp = FastMCP(name="Context Demo")
+
+@mcp.resource("resource://user-data")
+async def get_user_data(ctx: Context = CurrentContext()) -> dict:
+    await ctx.debug("Fetching user data")
+    return {"user_id": "example"}
+
+@mcp.prompt
+async def data_analysis_request(dataset: str, ctx: Context = CurrentContext()) -> str:
+    return f"Please analyze the following dataset: {dataset}"
+```
 
 **Key Points:**
 
-- The parameter name (e.g., `ctx`, `context`) doesn't matter, only the type hint `Context` is important.
-- The context parameter can be placed anywhere in your function's signature; it will not be exposed to MCP clients as a valid parameter.
-- The context is optional - functions that don't need it can omit the parameter entirely.
+- Dependency parameters are automatically excluded from the MCP schema—clients never see them.
 - Context methods are async, so your function usually needs to be async as well.
-- The type hint can be a union (`Context | None`) or use `Annotated[]` and it will still work properly.
-- Context is only available during a request; attempting to use context methods outside a request will raise errors. If you need to debug or call your context methods outside of a request, you can type your variable as `Context | None=None` to avoid missing argument errors.
+- **Each MCP request receives a new context object.** Context is scoped to a single request; state or data set in one request will not be available in subsequent requests.
+- Context is only available during a request; attempting to use context methods outside a request will raise errors.
 
-#### Tools
+### Legacy Type-Hint Injection
+
+For backwards compatibility, you can still access context by simply adding a parameter with the `Context` type hint. FastMCP will automatically inject the context instance:
 
 ```python {1, 6}
 from fastmcp import FastMCP, Context
@@ -46,56 +84,17 @@ mcp = FastMCP(name="Context Demo")
 @mcp.tool
 async def process_file(file_uri: str, ctx: Context) -> str:
     """Processes a file, using context for logging and resource access."""
-    # Context is available as the ctx parameter
+    # Context is injected automatically based on the type hint
     return "Processed file"
 ```
 
-#### Resources and Templates
+This approach still works for tools, resources, and prompts. The parameter name doesn't matter—only the `Context` type hint is important. The type hint can also be a union (`Context | None`) or use `Annotated[]`.
 
-<VersionBadge version="2.2.5" />
-
-```python {1, 6, 12}
-from fastmcp import FastMCP, Context
-
-mcp = FastMCP(name="Context Demo")
-
-@mcp.resource("resource://user-data")
-async def get_user_data(ctx: Context) -> dict:
-    """Fetch personalized user data based on the request context."""
-    # Context is available as the ctx parameter
-    return {"user_id": "example"}
-
-@mcp.resource("resource://users/{user_id}/profile")
-async def get_user_profile(user_id: str, ctx: Context) -> dict:
-    """Fetch user profile with context-aware logging."""
-    # Context is available as the ctx parameter
-    return {"id": user_id}
-```
-
-#### Prompts
-
-<VersionBadge version="2.2.5" />
-
-```python {1, 6}
-from fastmcp import FastMCP, Context
-
-mcp = FastMCP(name="Context Demo")
-
-@mcp.prompt
-async def data_analysis_request(dataset: str, ctx: Context) -> str:
-    """Generate a request to analyze data with contextual information."""
-    # Context is available as the ctx parameter
-    return f"Please analyze the following dataset: {dataset}"
-```
-
-
-### Via Runtime Dependency Function
+### Via `get_context()` Function
 
 <VersionBadge version="2.2.11" />
 
-While the simplest way to access context is through function parameter injection as shown above, there are cases where you need to access the context in code that may not be easy to modify to accept a context parameter, or that is nested deeper within your function calls.
-
-FastMCP provides dependency functions that allow you to retrieve the active context from anywhere within a server request's execution flow:
+For code nested deeper within your function calls where passing context through parameters is inconvenient, use `get_context()` to retrieve the active context from anywhere within a request's execution flow:
 
 ```python {2,9}
 from fastmcp import FastMCP
@@ -106,9 +105,9 @@ mcp = FastMCP(name="Dependency Demo")
 # Utility function that needs context but doesn't receive it as a parameter
 async def process_data(data: list[float]) -> dict:
     # Get the active context - only works when called within a request
-    ctx = get_context()    
+    ctx = get_context()
     await ctx.info(f"Processing {len(data)} data points")
-    
+
 @mcp.tool
 async def analyze_dataset(dataset_name: str) -> dict:
     # Call utility function that uses context internally
@@ -118,8 +117,8 @@ async def analyze_dataset(dataset_name: str) -> dict:
 
 **Important Notes:**
 
-- The `get_context` function should only be used within the context of a server request. Calling it outside of a request will raise a `RuntimeError`.
-- The `get_context` function is server-only and should not be used in client code.
+- The `get_context()` function should only be used within the context of a server request. Calling it outside of a request will raise a `RuntimeError`.
+- The `get_context()` function is server-only and should not be used in client code.
 
 ## Context Capabilities
 
@@ -176,77 +175,117 @@ See [Progress Reporting](/servers/progress) for detailed patterns and examples.
 
 ### Resource Access
 
-Read data from resources registered with your FastMCP server, allowing access to files, configuration, or dynamic content.
+List and read data from resources registered with your FastMCP server, allowing access to files, configuration, or dynamic content.
 
 ```python
+# List available resources
+resources = await ctx.list_resources()
+
+# Read a specific resource
 content_list = await ctx.read_resource("resource://config")
 content = content_list[0].content
 ```
 
-**Method signature:**
+**Method signatures:**
+- **`ctx.list_resources() -> list[MCPResource]`**: <VersionBadge version="2.13.0" /> Returns list of all available resources
 - **`ctx.read_resource(uri: str | AnyUrl) -> list[ReadResourceContents]`**: Returns a list of resource content parts
 
-### State Management
+### Prompt Access
 
-<VersionBadge version="2.11.0" />
+<VersionBadge version="2.13.0" />
 
-Store and share data across middleware and tool calls within a request. Context objects maintain a state dictionary that's especially useful for passing information from [middleware](/servers/middleware) to your tools.
+List and retrieve prompts registered with your FastMCP server, allowing tools and middleware to discover and use available prompts programmatically.
 
-To store a value in the context state, use `ctx.set_state(key, value)`. To retrieve a value, use `ctx.get_state(key)`.
+```python
+# List available prompts
+prompts = await ctx.list_prompts()
 
-This simplified example shows how to use MCP middleware to store user info in the context state, and how to access that state in a tool:
-
-```python {7-8, 16-17}
-from fastmcp.server.middleware import Middleware, MiddlewareContext
-
-class UserAuthMiddleware(Middleware):
-    async def on_call_tool(self, context: MiddlewareContext, call_next):
-
-        # Middleware stores user info in context state
-        context.fastmcp_context.set_state("user_id", "user_123")
-        context.fastmcp_context.set_state("permissions", ["read", "write"])
-        
-        return await call_next()
-
-@mcp.tool
-async def secure_operation(data: str, ctx: Context) -> str:
-    """Tool can access state set by middleware."""
-
-    user_id = ctx.get_state("user_id")  # "user_123"
-    permissions = ctx.get_state("permissions")  # ["read", "write"]
-    
-    if "write" not in permissions:
-        return "Access denied"
-    
-    return f"Processing {data} for user {user_id}"
+# Get a specific prompt with arguments
+result = await ctx.get_prompt("analyze_data", {"dataset": "users"})
+messages = result.messages
 ```
 
 **Method signatures:**
-- **`ctx.set_state(key: str, value: Any) -> None`**: Store a value in the context state
-- **`ctx.get_state(key: str) -> Any`**: Retrieve a value from the context state (returns None if not found)
+- **`ctx.list_prompts() -> list[MCPPrompt]`**: Returns list of all available prompts
+- **`ctx.get_prompt(name: str, arguments: dict[str, Any] | None = None) -> GetPromptResult`**: Get a specific prompt with optional arguments
 
-**State Inheritance:**
-When a new context is created (nested contexts), it inherits a copy of its parent's state. This ensures that:
-- State set on a child context never affects the parent context
-- State set on a parent context after the child context is initialized is not propagated to the child context
+### Session State
 
-This makes state management predictable and prevents unexpected side effects between nested operations.
+<VersionBadge version="3.0.0" />
+
+Store data that persists across multiple requests within the same MCP session. Session state is automatically keyed by the client's session, ensuring isolation between different clients.
+
+```python
+from fastmcp import FastMCP, Context
+
+mcp = FastMCP("stateful-app")
+
+@mcp.tool
+async def increment_counter(ctx: Context) -> int:
+    """Increment a counter that persists across tool calls."""
+    count = await ctx.get_state("counter") or 0
+    await ctx.set_state("counter", count + 1)
+    return count + 1
+
+@mcp.tool
+async def get_counter(ctx: Context) -> int:
+    """Get the current counter value."""
+    return await ctx.get_state("counter") or 0
+```
+
+Each client session has its own isolated state—two different clients calling `increment_counter` will each have their own counter.
+
+**Method signatures:**
+- **`await ctx.set_state(key: str, value: Any) -> None`**: Store a value in session state
+- **`await ctx.get_state(key: str) -> Any`**: Retrieve a value (returns None if not found)
+- **`await ctx.delete_state(key: str) -> None`**: Remove a value from session state
+
+<Note>
+State methods are async and require `await`. State expires after 1 day to prevent unbounded memory growth.
+</Note>
+
+#### Custom Storage Backends
+
+By default, session state uses an in-memory store suitable for single-server deployments. For distributed or serverless deployments, provide a custom storage backend:
+
+```python
+from key_value.aio.stores.redis import RedisStore
+
+# Use Redis for distributed state
+mcp = FastMCP("distributed-app", session_state_store=RedisStore(...))
+```
+
+Any backend compatible with the [py-key-value-aio](https://github.com/strawgate/py-key-value) `AsyncKeyValue` protocol works. See [Storage Backends](/servers/storage-backends) for more options including Redis, DynamoDB, and MongoDB.
+
+#### State During Initialization
+
+State set during `on_initialize` middleware persists to subsequent tool calls when using the same session object (STDIO, SSE, single-server HTTP). For distributed/serverless HTTP deployments where different machines handle init and tool calls, state is isolated by the `mcp-session-id` header.
 
 ### Change Notifications
 
-<VersionBadge version="2.9.1" />
+<VersionBadge version="3.0.0" />
 
-FastMCP automatically sends list change notifications when components (such as tools, resources, or prompts) are added, removed, enabled, or disabled. In rare cases where you need to manually trigger these notifications, you can use the context methods:
+FastMCP automatically sends list change notifications when components (such as tools, resources, or prompts) are added, removed, enabled, or disabled. In rare cases where you need to manually trigger these notifications, you can use the context's notification methods:
 
 ```python
+import mcp.types
+
 @mcp.tool
 async def custom_tool_management(ctx: Context) -> str:
     """Example of manual notification after custom tool changes."""
-    # After making custom changes to tools
-    await ctx.send_tool_list_changed()
-    await ctx.send_resource_list_changed()
-    await ctx.send_prompt_list_changed()
+    # In async code, send immediately
+    await ctx.send_notification(mcp.types.ToolListChangedNotification())
+    await ctx.send_notification(mcp.types.ResourceListChangedNotification())
+    await ctx.send_notification(mcp.types.PromptListChangedNotification())
     return "Notifications sent"
+
+
+@mcp.tool
+def sync_tool(ctx: Context) -> str:
+    """Example of notification from sync code."""
+    # In sync code, queue for background sending (~1 second delay)
+    ctx.send_notification_sync(mcp.types.ToolListChangedNotification())
+    return "Notification queued"
 ```
 
 These methods are primarily used internally by FastMCP's automatic notification system and most users will not need to invoke them directly.
@@ -262,6 +301,33 @@ async def my_tool(ctx: Context) -> None:
     server_name = ctx.fastmcp.name
     ...
 ```
+
+### Transport
+
+<VersionBadge version="3.0.0" />
+
+The `ctx.transport` property indicates which transport is being used to run the server. This is useful when your tool needs to behave differently depending on whether the server is running over STDIO, SSE, or Streamable HTTP. For example, you might want to return shorter responses over STDIO or adjust timeout behavior based on transport characteristics.
+
+The transport type is set once when the server starts and remains constant for the server's lifetime. It returns `None` when called outside of a server context (for example, in unit tests or when running code outside of an MCP request).
+
+```python
+from fastmcp import FastMCP, Context
+
+mcp = FastMCP("example")
+
+@mcp.tool
+def connection_info(ctx: Context) -> str:
+    if ctx.transport == "stdio":
+        return "Connected via STDIO"
+    elif ctx.transport == "sse":
+        return "Connected via SSE"
+    elif ctx.transport == "streamable-http":
+        return "Connected via Streamable HTTP"
+    else:
+        return "Transport unknown"
+```
+
+**Property signature:** `ctx.transport -> Literal["stdio", "sse", "streamable-http"] | None`
 
 ### MCP Request
 
@@ -281,7 +347,78 @@ async def request_info(ctx: Context) -> dict:
 
 - **`ctx.request_id -> str`**: Get the unique ID for the current MCP request
 - **`ctx.client_id -> str | None`**: Get the ID of the client making the request, if provided during initialization
-- **`ctx.session_id -> str | None`**: Get the MCP session ID for session-based data sharing (HTTP transports only)
+- **`ctx.session_id -> str`**: Get the MCP session ID for session-based data sharing. Raises `RuntimeError` if the MCP session is not yet established.
+
+#### Request Context Availability
+
+<VersionBadge version="2.13.1" />
+
+The `ctx.request_context` property provides access to the underlying MCP request context, but returns `None` when the MCP session has not been established yet. This typically occurs:
+
+- During middleware execution in the `on_request` hook before the MCP handshake completes
+- During the initialization phase of client connections
+
+The MCP request context is distinct from the HTTP request. For HTTP transports, HTTP request data may be available even when the MCP session is not yet established.
+
+To safely access the request context in situations where it may not be available:
+
+```python
+from fastmcp import FastMCP, Context
+from fastmcp.server.dependencies import get_http_request
+
+mcp = FastMCP(name="Session Aware Demo")
+
+@mcp.tool
+async def session_info(ctx: Context) -> dict:
+    """Return session information when available."""
+
+    # Check if MCP session is available
+    if ctx.request_context:
+        # MCP session available - can access MCP-specific attributes
+        return {
+            "session_id": ctx.session_id,
+            "request_id": ctx.request_id,
+            "has_meta": ctx.request_context.meta is not None
+        }
+    else:
+        # MCP session not available - use HTTP helpers for request data (if using HTTP transport)
+        request = get_http_request()
+        return {
+            "message": "MCP session not available",
+            "user_agent": request.headers.get("user-agent", "Unknown")
+        }
+```
+
+For HTTP request access that works regardless of MCP session availability (when using HTTP transports), use the [HTTP request helpers](#http-requests) like `get_http_request()` and `get_http_headers()`.
+
+#### Client Metadata
+
+<VersionBadge version="2.13.1" />
+
+Clients can send contextual information with their requests using the `meta` parameter. This metadata is accessible through `ctx.request_context.meta` and is available for all MCP operations (tools, resources, prompts).
+
+The `meta` field is `None` when clients don't provide metadata. When provided, metadata is accessible via attribute access (e.g., `meta.user_id`) rather than dictionary access. The structure of metadata is determined by the client making the request.
+
+```python
+@mcp.tool
+def send_email(to: str, subject: str, body: str, ctx: Context) -> str:
+    """Send an email, logging metadata about the request."""
+
+    # Access client-provided metadata
+    meta = ctx.request_context.meta
+
+    if meta:
+        # Meta is accessed as an object with attribute access
+        user_id = meta.user_id if hasattr(meta, 'user_id') else None
+        trace_id = meta.trace_id if hasattr(meta, 'trace_id') else None
+
+        # Use metadata for logging, observability, etc.
+        if trace_id:
+            log_with_trace(f"Sending email for user {user_id}", trace_id)
+
+    # Send the email...
+    return f"Email sent to {to}"
+```
 
 <Warning>
 The MCP request is part of the low-level MCP SDK and intended for advanced use cases. Most users will not need to use it directly.
@@ -426,3 +563,90 @@ async def get_tenant_data(resource_id: str) -> dict:
         "data": f"Tenant-specific data for {tenant_id}",
     }
 ```
+
+## Custom Dependencies
+
+<VersionBadge version="2.14" />
+
+FastMCP's dependency injection is powered by [Docket](https://github.com/chrisguidry/docket), which provides a flexible system for injecting values into your functions. Beyond the built-in dependencies like `CurrentContext()`, you can create your own.
+
+### Using `Depends()`
+
+The simplest way to create a custom dependency is with `Depends()`. Pass any callable (sync or async function, or async context manager) and its return value will be injected:
+
+```python
+from contextlib import asynccontextmanager
+from fastmcp import FastMCP
+from fastmcp.dependencies import Depends
+
+mcp = FastMCP(name="Custom Deps Demo")
+
+# Simple function dependency
+def get_config() -> dict:
+    return {"api_url": "https://api.example.com", "timeout": 30}
+
+# Async function dependency
+async def get_user_id() -> int:
+    return 42
+
+@mcp.tool
+async def fetch_data(
+    query: str,
+    config: dict = Depends(get_config),
+    user_id: int = Depends(get_user_id),
+) -> str:
+    return f"User {user_id} fetching '{query}' from {config['api_url']}"
+```
+
+Dependencies using `Depends()` are automatically excluded from the MCP schema—clients never see them as parameters.
+
+### Resource Management with Context Managers
+
+For dependencies that need cleanup (database connections, file handles, etc.), use an async context manager:
+
+```python
+from contextlib import asynccontextmanager
+from fastmcp import FastMCP
+from fastmcp.dependencies import Depends
+
+mcp = FastMCP(name="Resource Demo")
+
+@asynccontextmanager
+async def get_database():
+    db = await connect_to_database()
+    try:
+        yield db
+    finally:
+        await db.close()
+
+@mcp.tool
+async def query_users(sql: str, db = Depends(get_database)) -> list:
+    return await db.execute(sql)
+```
+
+The context manager's cleanup code runs after your function completes, even if an error occurs.
+
+### Nested Dependencies
+
+Dependencies can depend on other dependencies:
+
+```python
+from fastmcp import FastMCP
+from fastmcp.dependencies import Depends
+
+mcp = FastMCP(name="Nested Demo")
+
+def get_base_url() -> str:
+    return "https://api.example.com"
+
+def get_api_client(base_url: str = Depends(get_base_url)) -> dict:
+    return {"base_url": base_url, "version": "v1"}
+
+@mcp.tool
+async def call_api(endpoint: str, client: dict = Depends(get_api_client)) -> str:
+    return f"Calling {client['base_url']}/{client['version']}/{endpoint}"
+```
+
+### Advanced: Subclassing `Dependency`
+
+For more complex dependency patterns—like dependencies that need access to Docket's execution context or require custom lifecycle management—you can subclass Docket's `Dependency` class. See the [Docket documentation on dependencies](https://chrisguidry.github.io/docket/dependencies/) for details.

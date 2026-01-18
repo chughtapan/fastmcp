@@ -10,7 +10,59 @@ Base classes and interfaces for FastMCP resources.
 
 ## Classes
 
-### `Resource` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L34" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+### `ResourceContent` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L36" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+
+Wrapper for resource content with optional MIME type and metadata.
+
+Accepts any value for content - strings and bytes pass through directly,
+other types (dict, list, BaseModel, etc.) are automatically JSON-serialized.
+
+
+**Methods:**
+
+#### `to_mcp_resource_contents` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L91" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+```python
+to_mcp_resource_contents(self, uri: AnyUrl | str) -> mcp.types.TextResourceContents | mcp.types.BlobResourceContents
+```
+
+Convert to MCP resource contents type.
+
+**Args:**
+- `uri`: The URI of the resource (required by MCP types)
+
+**Returns:**
+- TextResourceContents for str content, BlobResourceContents for bytes
+
+
+### `ResourceResult` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L118" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+
+Canonical result type for resource reads.
+
+Provides explicit control over resource responses: multiple content items,
+per-item MIME types, and metadata at both the item and result level.
+
+
+**Methods:**
+
+#### `to_mcp_result` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L193" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+```python
+to_mcp_result(self, uri: AnyUrl | str) -> mcp.types.ReadResourceResult
+```
+
+Convert to MCP ReadResourceResult.
+
+**Args:**
+- `uri`: The URI of the resource (required by MCP types)
+
+**Returns:**
+- MCP ReadResourceResult with converted contents
+
+
+### `Resource` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L209" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 
 Base class for all resources.
@@ -18,25 +70,13 @@ Base class for all resources.
 
 **Methods:**
 
-#### `enable` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L53" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `from_function` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L234" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
-enable(self) -> None
+from_function(cls, fn: Callable[..., Any], uri: str | AnyUrl) -> FunctionResource
 ```
 
-#### `disable` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L61" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
-
-```python
-disable(self) -> None
-```
-
-#### `from_function` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L70" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
-
-```python
-from_function(fn: Callable[..., Any], uri: str | AnyUrl, name: str | None = None, title: str | None = None, description: str | None = None, mime_type: str | None = None, tags: set[str] | None = None, enabled: bool | None = None, annotations: Annotations | None = None, meta: dict[str, Any] | None = None) -> FunctionResource
-```
-
-#### `set_default_mime_type` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L97" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `set_default_mime_type` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L273" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
 set_default_mime_type(cls, mime_type: str | None) -> str
@@ -45,7 +85,7 @@ set_default_mime_type(cls, mime_type: str | None) -> str
 Set default MIME type if not provided.
 
 
-#### `set_default_name` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L104" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `set_default_name` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L280" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
 set_default_name(self) -> Self
@@ -54,67 +94,80 @@ set_default_name(self) -> Self
 Set default name from URI if not provided.
 
 
-#### `read` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L115" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `read` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L290" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
-read(self) -> str | bytes
+read(self) -> str | bytes | ResourceResult
 ```
 
 Read the resource content.
 
+Subclasses implement this to return resource data. Supported return types:
+    - str: Text content
+    - bytes: Binary content
+    - ResourceResult: Full control over contents and result-level meta
 
-#### `to_mcp_resource` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L119" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+#### `convert_result` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L302" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
-to_mcp_resource(self, **overrides: Any) -> MCPResource
+convert_result(self, raw_value: Any) -> ResourceResult
 ```
 
-Convert the resource to an MCPResource.
+Convert a raw result to ResourceResult.
+
+This is used in two contexts:
+1. In _read() to convert user function return values to ResourceResult
+2. In tasks_result_handler() to convert Docket task results to ResourceResult
+
+Handles ResourceResult passthrough and converts raw values using
+ResourceResult's normalization.
 
 
-#### `key` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L143" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `to_mcp_resource` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L358" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+```python
+to_mcp_resource(self, **overrides: Any) -> SDKResource
+```
+
+Convert the resource to an SDKResource.
+
+
+#### `key` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L381" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
 key(self) -> str
 ```
 
-The key of the component. This is used for internal bookkeeping
-and may reflect e.g. prefixes or other identifiers. You should not depend on
-keys having a certain value, as the same tool loaded from different
-hierarchies of servers may have different keys.
+The globally unique lookup key for this resource.
 
 
-### `FunctionResource` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L153" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
-
-
-A resource that defers data loading by wrapping a function.
-
-The function is only called when the resource is read, allowing for lazy loading
-of potentially expensive data. This is particularly useful when listing resources,
-as the function won't be called until the resource is actually accessed.
-
-The function can return:
-- str for text content (default)
-- bytes for binary content
-- other types will be converted to JSON
-
-
-**Methods:**
-
-#### `from_function` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L169" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `register_with_docket` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L386" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
-from_function(cls, fn: Callable[..., Any], uri: str | AnyUrl, name: str | None = None, title: str | None = None, description: str | None = None, mime_type: str | None = None, tags: set[str] | None = None, enabled: bool | None = None, annotations: Annotations | None = None, meta: dict[str, Any] | None = None) -> FunctionResource
+register_with_docket(self, docket: Docket) -> None
 ```
 
-Create a FunctionResource from a function.
+Register this resource with docket for background execution.
 
 
-#### `read` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L198" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `add_to_docket` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L392" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
-read(self) -> str | bytes
+add_to_docket(self, docket: Docket, **kwargs: Any) -> Execution
 ```
 
-Read the resource by calling the wrapped function.
+Schedule this resource for background execution via docket.
 
+**Args:**
+- `docket`: The Docket instance
+- `fn_key`: Function lookup key in Docket registry (defaults to self.key)
+- `task_key`: Redis storage key for the result
+- `**kwargs`: Additional kwargs passed to docket.add()
+
+
+#### `get_span_attributes` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/resources/resource.py#L413" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+```python
+get_span_attributes(self) -> dict[str, Any]
+```

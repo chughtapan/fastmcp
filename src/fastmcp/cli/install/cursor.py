@@ -1,10 +1,12 @@
 """Cursor integration for FastMCP install using Cyclopts."""
 
 import base64
+import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote, urlparse
 
 import cyclopts
 from rich import print
@@ -36,8 +38,9 @@ def generate_cursor_deeplink(
     config_json = server_config.model_dump_json(exclude_none=True)
     config_b64 = base64.urlsafe_b64encode(config_json.encode()).decode()
 
-    # Generate the deeplink URL
-    deeplink = f"cursor://anysphere.cursor-deeplink/mcp/install?name={server_name}&config={config_b64}"
+    # Generate the deeplink URL with properly encoded server name
+    encoded_name = quote(server_name, safe="")
+    deeplink = f"cursor://anysphere.cursor-deeplink/mcp/install?name={encoded_name}&config={config_b64}"
 
     return deeplink
 
@@ -51,17 +54,20 @@ def open_deeplink(deeplink: str) -> bool:
     Returns:
         True if the command succeeded, False otherwise
     """
+    parsed = urlparse(deeplink)
+    if parsed.scheme != "cursor":
+        logger.warning(f"Invalid deeplink scheme: {parsed.scheme}")
+        return False
+
     try:
         if sys.platform == "darwin":  # macOS
             subprocess.run(["open", deeplink], check=True, capture_output=True)
         elif sys.platform == "win32":  # Windows
-            subprocess.run(
-                ["start", deeplink], shell=True, check=True, capture_output=True
-            )
+            os.startfile(deeplink)
         else:  # Linux and others
             subprocess.run(["xdg-open", deeplink], check=True, capture_output=True)
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         return False
 
 
@@ -110,9 +116,9 @@ def install_cursor_workspace(
     env_config = UVEnvironment(
         python=python_version,
         dependencies=(with_packages or []) + ["fastmcp"],
-        requirements=str(with_requirements.resolve()) if with_requirements else None,
-        project=str(project.resolve()) if project else None,
-        editable=[str(p.resolve()) for p in with_editable] if with_editable else None,
+        requirements=with_requirements,
+        project=project,
+        editable=with_editable,
     )
     # Build server spec from parsed components
     if server_object:
@@ -180,9 +186,9 @@ def install_cursor(
     env_config = UVEnvironment(
         python=python_version,
         dependencies=(with_packages or []) + ["fastmcp"],
-        requirements=str(with_requirements.resolve()) if with_requirements else None,
-        project=str(project.resolve()) if project else None,
-        editable=[str(p.resolve()) for p in with_editable] if with_editable else None,
+        requirements=with_requirements,
+        project=project,
+        editable=with_editable,
     )
     # Build server spec from parsed components
     if server_object:
@@ -246,15 +252,12 @@ async def cursor_command(
         cyclopts.Parameter(
             "--with-editable",
             help="Directory with pyproject.toml to install in editable mode (can be used multiple times)",
-            negative="",
         ),
     ] = None,
     with_packages: Annotated[
         list[str] | None,
         cyclopts.Parameter(
-            "--with",
-            help="Additional packages to install (can be used multiple times)",
-            negative="",
+            "--with", help="Additional packages to install (can be used multiple times)"
         ),
     ] = None,
     env_vars: Annotated[
@@ -262,7 +265,6 @@ async def cursor_command(
         cyclopts.Parameter(
             "--env",
             help="Environment variables in KEY=VALUE format (can be used multiple times)",
-            negative="",
         ),
     ] = None,
     env_file: Annotated[

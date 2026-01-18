@@ -13,23 +13,25 @@ Prompts are reusable message templates exposed by MCP servers. They can accept a
 
 ## Listing Prompts
 
-Use `list_prompts()` to retrieve all available prompt templates:
+Use `list_prompts()` to retrieve all available prompt templates. When the server paginates results, the client automatically fetches all pages and returns the complete list.
 
 ```python
 async with client:
     prompts = await client.list_prompts()
     # prompts -> list[mcp.types.Prompt]
-    
+
     for prompt in prompts:
         print(f"Prompt: {prompt.name}")
         print(f"Description: {prompt.description}")
         if prompt.arguments:
             print(f"Arguments: {[arg.name for arg in prompt.arguments]}")
         # Access tags and other metadata
-        if hasattr(prompt, '_meta') and prompt._meta:
-            fastmcp_meta = prompt._meta.get('_fastmcp', {})
+        if prompt.meta:
+            fastmcp_meta = prompt.meta.get('fastmcp', {})
             print(f"Tags: {fastmcp_meta.get('tags', [])}")
 ```
+
+For manual pagination control, use `list_prompts_mcp()` with the `cursor` parameter. See [Pagination](/servers/pagination#manual-pagination) for details.
 
 ### Filtering by Tags
 
@@ -44,16 +46,16 @@ async with client:
     # Filter prompts by tag
     analysis_prompts = [
         prompt for prompt in prompts 
-        if hasattr(prompt, '_meta') and prompt._meta and
-           prompt._meta.get('_fastmcp', {}) and
-           'analysis' in prompt._meta.get('_fastmcp', {}).get('tags', [])
+        if prompt.meta and
+           prompt.meta.get('fastmcp', {}) and
+           'analysis' in prompt.meta.get('fastmcp', {}).get('tags', [])
     ]
     
     print(f"Found {len(analysis_prompts)} analysis prompts")
 ```
 
 <Note>
-The `_meta` field is part of the standard MCP specification. FastMCP servers include tags and other metadata within a `_fastmcp` namespace (e.g., `_meta._fastmcp.tags`) to avoid conflicts with user-defined metadata. This behavior can be controlled with the server's `include_fastmcp_meta` setting - when disabled, the `_fastmcp` namespace won't be included. Other MCP server implementations may not provide this metadata structure.
+The `meta` field is part of the standard MCP specification. FastMCP servers always include tags and other metadata within a `fastmcp` namespace (e.g., `meta.fastmcp.tags`) to avoid conflicts with user-defined metadata. Component versions are also included in the metadata when available (e.g., `meta.fastmcp.version`). Other MCP server implementations may not provide this metadata structure.
 </Note>
 
 ## Using Prompts
@@ -85,11 +87,28 @@ async with client:
         "name": "Alice",
         "role": "administrator"
     })
-    
+
     # Access the personalized messages
     for message in result.messages:
         print(f"Generated message: {message.content}")
 ```
+
+### Requesting Specific Versions
+
+<VersionBadge version="3.0.0" />
+
+When a server has multiple versions of a prompt, you can request a specific version instead of the default (highest) version.
+
+```python
+async with client:
+    # Get the highest version (default)
+    result = await client.get_prompt("summarize", {"text": "..."})
+
+    # Get a specific version
+    result_v1 = await client.get_prompt("summarize", {"text": "..."}, version="1.0")
+```
+
+To discover available versions, check the `meta.fastmcp.versions` field when listing prompts. See [Version Selection](#version-selection) below for more details.
 
 ## Automatic Argument Serialization
 
@@ -214,3 +233,47 @@ async with client:
 <Tip>
 Prompt arguments and their expected types depend on the specific prompt implementation. Check the server's documentation or use `list_prompts()` to see available arguments for each prompt.
 </Tip>
+
+## Version Selection
+
+<VersionBadge version="3.0.0" />
+
+FastMCP servers can expose multiple versions of the same prompt. By default, clients receive and request the highest version, but you can request a specific version when needed.
+
+### Discovering Versions
+
+When a server registers multiple versions of a prompt, the `list_prompts()` response includes version information in the metadata. The `meta.fastmcp.version` field shows which version is being returned, while `meta.fastmcp.versions` lists all available versions sorted from highest to lowest.
+
+```python
+async with client:
+    prompts = await client.list_prompts()
+
+    for prompt in prompts:
+        if prompt.meta:
+            fastmcp_meta = prompt.meta.get("fastmcp", {})
+            version = fastmcp_meta.get("version")
+            all_versions = fastmcp_meta.get("versions")
+            if all_versions:
+                print(f"{prompt.name}: v{version} (available: {all_versions})")
+```
+
+Unversioned prompts omit these metadata fields entirely.
+
+### Getting Specific Versions
+
+Pass the `version` parameter to `get_prompt()` to render a specific version instead of the highest.
+
+```python
+async with client:
+    # Get the highest version (default)
+    result = await client.get_prompt("summarize", {"text": "..."})
+
+    # Get version 1.0 specifically
+    result_v1 = await client.get_prompt("summarize", {"text": "..."}, version="1.0")
+```
+
+If the requested version doesn't exist, the server raises a `NotFoundError`. This ensures you get exactly what you asked for rather than silently falling back to a different version.
+
+<Note>
+Version selection is a FastMCP extension to the MCP protocol. See [Versioning](/servers/versioning#requesting-specific-versions) for details on how this works at the protocol level for non-FastMCP clients.
+</Note>

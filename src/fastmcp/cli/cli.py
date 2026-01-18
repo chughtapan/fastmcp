@@ -13,13 +13,14 @@ from typing import Annotated, Literal
 
 import cyclopts
 import pyperclip
+from cyclopts import Parameter
 from rich.console import Console
 from rich.table import Table
 
 import fastmcp
 from fastmcp.cli import run as run_module
 from fastmcp.cli.install import install_app
-from fastmcp.server.server import FastMCP
+from fastmcp.cli.tasks import tasks_app
 from fastmcp.utilities.cli import is_already_in_uv_subprocess, load_and_merge_config
 from fastmcp.utilities.inspect import (
     InspectFormat,
@@ -28,7 +29,7 @@ from fastmcp.utilities.inspect import (
 )
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.mcp_server_config import MCPServerConfig
-from fastmcp.utilities.mcp_server_config.v1.environments.uv import UVEnvironment
+from fastmcp.utilities.version_check import check_for_newer_version
 
 logger = get_logger("cli")
 console = Console()
@@ -37,6 +38,8 @@ app = cyclopts.App(
     name="fastmcp",
     help="FastMCP 2.0 - The fast, Pythonic way to build MCP servers and clients.",
     version=fastmcp.__version__,
+    # Disable automatic negative parameters by default
+    default_parameter=Parameter(negative=()),
 )
 
 
@@ -46,9 +49,7 @@ def _get_npx_command():
         # Try both npx.cmd and npx.exe on Windows
         for cmd in ["npx.cmd", "npx.exe", "npx"]:
             try:
-                subprocess.run(
-                    [cmd, "--version"], check=True, capture_output=True, shell=True
-                )
+                subprocess.run([cmd, "--version"], check=True, capture_output=True)
                 return cmd
             except subprocess.CalledProcessError:
                 continue
@@ -80,7 +81,7 @@ def with_argv(args: list[str] | None):
         original = sys.argv[:]
         try:
             # Preserve the script name (sys.argv[0]) and replace the rest
-            sys.argv = [sys.argv[0]] + args
+            sys.argv = [sys.argv[0], *args]
             yield
         finally:
             sys.argv = original
@@ -93,11 +94,7 @@ def version(
     *,
     copy: Annotated[
         bool,
-        cyclopts.Parameter(
-            "--copy",
-            help="Copy version information to clipboard",
-            negative="",
-        ),
+        cyclopts.Parameter("--copy", help="Copy version information to clipboard"),
     ] = False,
 ):
     """Display version information and platform details."""
@@ -106,7 +103,7 @@ def version(
         "MCP version": importlib.metadata.version("mcp"),
         "Python version": platform.python_version(),
         "Platform": platform.platform(),
-        "FastMCP root path": Path(fastmcp.__file__).resolve().parents[1],
+        "FastMCP root path": Path(fastmcp.__file__ or ".").resolve().parents[1],
     }
 
     g = Table.grid(padding=(0, 1))
@@ -125,6 +122,14 @@ def version(
     else:
         console.print(g)
 
+        # Check for updates (not included in --copy output)
+        if newer_version := check_for_newer_version():
+            console.print()
+            console.print(
+                f"[bold]🎉 FastMCP update available:[/bold] [green]{newer_version}[/green]"
+            )
+            console.print("[dim]Run: pip install --upgrade fastmcp[/dim]")
+
 
 @app.command
 async def dev(
@@ -135,15 +140,12 @@ async def dev(
         cyclopts.Parameter(
             "--with-editable",
             help="Directory containing pyproject.toml to install in editable mode (can be used multiple times)",
-            negative="",
         ),
     ] = None,
     with_packages: Annotated[
         list[str] | None,
         cyclopts.Parameter(
-            "--with",
-            help="Additional packages to install (can be used multiple times)",
-            negative="",
+            "--with", help="Additional packages to install (can be used multiple times)"
         ),
     ] = None,
     inspector_version: Annotated[
@@ -188,6 +190,21 @@ async def dev(
             help="Run the command within the given project directory",
         ),
     ] = None,
+    reload: Annotated[
+        bool,
+        cyclopts.Parameter(
+            "--reload",
+            help="Enable auto-reload on file changes (enabled by default)",
+            negative="--no-reload",
+        ),
+    ] = True,
+    reload_dir: Annotated[
+        list[Path] | None,
+        cyclopts.Parameter(
+            "--reload-dir",
+            help="Directories to watch for changes (default: current directory)",
+        ),
+    ] = None,
 ) -> None:
     """Run an MCP server with the MCP Inspector for development.
 
@@ -226,29 +243,11 @@ async def dev(
     )
 
     try:
-        # Load server to check for deprecated dependencies
         if not config:
             logger.error("No configuration available")
             sys.exit(1)
         assert config is not None  # For type checker
-        server: FastMCP = await config.source.load_server()
-        if server.dependencies:
-            import warnings
-
-            warnings.warn(
-                f"Server '{server.name}' uses deprecated 'dependencies' parameter (deprecated in FastMCP 2.11.4). "
-                "Please migrate to fastmcp.json configuration file. "
-                "See https://gofastmcp.com/docs/deployment/server-configuration for details.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            # Merge server dependencies with environment dependencies
-            env_deps = config.environment.dependencies or []
-            all_deps = list(set(env_deps + server.dependencies))
-            if not config.environment:
-                config.environment = UVEnvironment(dependencies=all_deps)
-            else:
-                config.environment.dependencies = all_deps
+        await config.source.load_server()
 
         env_vars = {}
         if ui_port:
@@ -269,20 +268,26 @@ async def dev(
         if inspector_version:
             inspector_cmd += f"@{inspector_version}"
 
+        # Build the fastmcp run command
+        fastmcp_cmd = ["fastmcp", "run", server_spec, "--no-banner"]
+
+        # Add reload flags if enabled - the server will handle reloading
+        if reload:
+            fastmcp_cmd.append("--reload")
+            if reload_dir:
+                for dir_path in reload_dir:
+                    fastmcp_cmd.extend(["--reload-dir", str(dir_path)])
+
         # Use the environment from config (already has CLI overrides applied)
-        uv_cmd = config.environment.build_command(
-            ["fastmcp", "run", server_spec, "--no-banner"]
-        )
+        uv_cmd = config.environment.build_command(fastmcp_cmd)
 
         # Set marker to prevent infinite loops when subprocess calls FastMCP
         env = dict(os.environ.items()) | env_vars | {"FASTMCP_UV_SPAWNED": "1"}
 
-        # Run the MCP Inspector command with shell=True on Windows
-        shell = sys.platform == "win32"
+        # Run the MCP Inspector command
         process = subprocess.run(
-            [npx_cmd, inspector_cmd] + uv_cmd,
+            [npx_cmd, inspector_cmd, *uv_cmd],
             check=True,
-            shell=shell,
             env=env,
         )
         sys.exit(process.returncode)
@@ -347,11 +352,7 @@ async def run(
     ] = None,
     no_banner: Annotated[
         bool,
-        cyclopts.Parameter(
-            "--no-banner",
-            help="Don't show the server banner",
-            negative="",
-        ),
+        cyclopts.Parameter("--no-banner", help="Don't show the server banner"),
     ] = False,
     python: Annotated[
         str | None,
@@ -363,9 +364,7 @@ async def run(
     with_packages: Annotated[
         list[str] | None,
         cyclopts.Parameter(
-            "--with",
-            help="Additional packages to install (can be used multiple times)",
-            negative="",
+            "--with", help="Additional packages to install (can be used multiple times)"
         ),
     ] = None,
     project: Annotated[
@@ -387,7 +386,6 @@ async def run(
         cyclopts.Parameter(
             "--skip-source",
             help="Skip source preparation step (use when source is already prepared)",
-            negative="",
         ),
     ] = False,
     skip_env: Annotated[
@@ -395,7 +393,28 @@ async def run(
         cyclopts.Parameter(
             "--skip-env",
             help="Skip environment configuration (for internal use when already in a uv environment)",
-            negative="",
+        ),
+    ] = False,
+    reload: Annotated[
+        bool,
+        cyclopts.Parameter(
+            "--reload",
+            negative="--no-reload",
+            help="Enable auto-reload on file changes (development mode)",
+        ),
+    ] = False,
+    reload_dir: Annotated[
+        list[Path] | None,
+        cyclopts.Parameter(
+            "--reload-dir",
+            help="Directories to watch for changes (default: current directory)",
+        ),
+    ] = None,
+    stateless: Annotated[
+        bool,
+        cyclopts.Parameter(
+            "--stateless",
+            help="Run in stateless mode (no session, used internally for reload)",
         ),
     ] = False,
 ) -> None:
@@ -446,8 +465,10 @@ async def run(
     final_log_level = log_level or config.deployment.log_level
     final_server_args = server_args or config.deployment.args
     # Use CLI override if provided, otherwise use settings
-    # no_banner CLI flag overrides the show_cli_banner setting
-    final_no_banner = no_banner if no_banner else not fastmcp.settings.show_cli_banner
+    # no_banner CLI flag overrides the show_server_banner setting
+    final_no_banner = (
+        no_banner if no_banner else not fastmcp.settings.show_server_banner
+    )
 
     logger.debug(
         "Running server or client",
@@ -461,6 +482,57 @@ async def run(
             "server_args": list(final_server_args) if final_server_args else [],
         },
     )
+
+    # Handle reload mode
+    if reload:
+        # SSE is incompatible with reload (no stateless mode exists)
+        if final_transport == "sse":
+            logger.warning(
+                "--reload is not supported with SSE transport (sessions are lost on restart). "
+                "Use streamable-http transport instead, or use --no-reload. "
+                "Running without reload."
+            )
+            # Fall through to normal execution
+        else:
+            # Build command for subprocess (with --no-reload to prevent infinite spawning)
+            reload_cmd = ["fastmcp", "run", server_spec]
+            if final_transport:
+                reload_cmd.extend(["--transport", final_transport])
+            if final_transport != "stdio":
+                if final_host:
+                    reload_cmd.extend(["--host", final_host])
+                if final_port:
+                    reload_cmd.extend(["--port", str(final_port)])
+                if final_path:
+                    reload_cmd.extend(["--path", final_path])
+            if final_log_level:
+                reload_cmd.extend(["--log-level", final_log_level])
+            if final_no_banner:
+                reload_cmd.append("--no-banner")
+            reload_cmd.append("--no-reload")  # Prevent infinite spawning
+            reload_cmd.append("--stateless")  # Stateless mode for reload compatibility
+
+            # If environment setup is needed, wrap with uv
+            test_cmd = ["test"]
+            needs_uv = (
+                config.environment.build_command(test_cmd) != test_cmd and not skip_env
+            )
+            if needs_uv:
+                # Add --skip-env to prevent nested uv runs (child would spawn another uv)
+                reload_cmd.append("--skip-env")
+
+            if final_server_args:
+                reload_cmd.append("--")
+                reload_cmd.extend(final_server_args)
+
+            if needs_uv:
+                reload_cmd = config.environment.build_command(reload_cmd)
+
+            is_stdio = final_transport in ("stdio", None)
+            await run_module.run_with_reload(
+                reload_cmd, reload_dirs=reload_dir, is_stdio=is_stdio
+            )
+            return
 
     # Check if we need to use uv run (but skip if we're already in uv or user said to skip)
     # We check if the environment would modify the command
@@ -506,7 +578,7 @@ async def run(
             process = subprocess.run(cmd, check=True, env=env)
             sys.exit(process.returncode)
         except subprocess.CalledProcessError as e:
-            logger.error(
+            logger.exception(
                 f"Failed to run: {e}",
                 extra={
                     "server_spec": server_spec,
@@ -528,9 +600,10 @@ async def run(
                 server_args=list(final_server_args) if final_server_args else [],
                 show_banner=not final_no_banner,
                 skip_source=skip_source,
+                stateless=stateless,
             )
         except Exception as e:
-            logger.error(
+            logger.exception(
                 f"Failed to run: {e}",
                 extra={
                     "server_spec": server_spec,
@@ -568,9 +641,7 @@ async def inspect(
     with_packages: Annotated[
         list[str] | None,
         cyclopts.Parameter(
-            "--with",
-            help="Additional packages to install (can be used multiple times)",
-            negative="",
+            "--with", help="Additional packages to install (can be used multiple times)"
         ),
     ] = None,
     project: Annotated[
@@ -592,7 +663,6 @@ async def inspect(
         cyclopts.Parameter(
             "--skip-env",
             help="Skip environment configuration (for internal use when already in a uv environment)",
-            negative="",
         ),
     ] = False,
 ) -> None:
@@ -717,6 +787,10 @@ async def inspect(
             console.print(f"  Name:         {info.name}")
             if info.version:
                 console.print(f"  Version:      {info.version}")
+            if info.website_url:
+                console.print(f"  Website:      {info.website_url}")
+            if info.icons:
+                console.print(f"  Icons:        {len(info.icons)}")
             console.print(f"  Generation:   {info.server_generation}")
             if info.instructions:
                 console.print(f"  Instructions: {info.instructions}")
@@ -766,7 +840,7 @@ async def inspect(
             console.print(formatted_json.decode("utf-8"))
 
     except Exception as e:
-        logger.error(
+        logger.exception(
             f"Failed to inspect server: {e}",
             extra={
                 "server_spec": server_spec,
@@ -838,11 +912,13 @@ async def prepare(
             )
             sys.exit(1)
 
+    assert config_path is not None
     config_file = Path(config_path)
     if not config_file.exists():
         logger.error(f"Configuration file not found: {config_path}")
         sys.exit(1)
 
+    assert output_dir is not None
     output_path = Path(output_dir)
 
     try:
@@ -872,6 +948,9 @@ app.command(project_app)
 
 # Add install subcommands using proper Cyclopts pattern
 app.command(install_app)
+
+# Add tasks subcommand group
+app.command(tasks_app)
 
 
 if __name__ == "__main__":

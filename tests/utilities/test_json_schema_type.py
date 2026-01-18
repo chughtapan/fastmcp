@@ -1149,7 +1149,7 @@ class TestEdgeCases:
         Type = json_schema_to_type(schema)
         validator = TypeAdapter(Type)
         result = validator.validate_python({"name": "test"})
-        assert result.name == "test"
+        assert result.name == "test"  # type: ignore[attr-defined]
 
     def test_recursive_defaults(self):
         schema = {
@@ -1165,8 +1165,8 @@ class TestEdgeCases:
         Type = json_schema_to_type(schema)
         validator = TypeAdapter(Type)
         result = validator.validate_python({})
-        assert result.node.value == "default"
-        assert result.node.next is None
+        assert result.node.value == "default"  # type: ignore[attr-defined]
+        assert result.node.next is None  # type: ignore[attr-defined]
 
     def test_mixed_type_array(self):
         schema = {
@@ -1225,9 +1225,9 @@ class TestNameHandling:
         Type = json_schema_to_type(schema)
         assert Type.__name__ == "Parent"
         child_field_type = get_dataclass_field(Type, "child").type
-        assert child_field_type.__origin__ is Union  # ty: ignore[possibly-unbound-attribute]
-        assert child_field_type.__args__[0].__name__ == "Child"  # ty: ignore[possibly-unbound-attribute]
-        assert child_field_type.__args__[1] is type(None)  # ty: ignore[possibly-unbound-attribute]
+        assert child_field_type.__origin__ is Union  # ty: ignore[possibly-missing-attribute]
+        assert child_field_type.__args__[0].__name__ == "Child"  # ty: ignore[possibly-missing-attribute]
+        assert child_field_type.__args__[1] is type(None)  # ty: ignore[possibly-missing-attribute]
 
     def test_recursive_schema_naming(self):
         schema = {
@@ -1240,9 +1240,9 @@ class TestNameHandling:
 
         next_field_type = get_dataclass_field(Type, "next").type
 
-        assert next_field_type.__origin__ is Union  # ty: ignore[possibly-unbound-attribute]
-        assert next_field_type.__args__[0].__forward_arg__ == "Node"  # ty: ignore[possibly-unbound-attribute]
-        assert next_field_type.__args__[1] is type(None)  # ty: ignore[possibly-unbound-attribute]
+        assert next_field_type.__origin__ is Union  # ty: ignore[possibly-missing-attribute]
+        assert next_field_type.__args__[0].__forward_arg__ == "Node"  # ty: ignore[possibly-missing-attribute]
+        assert next_field_type.__args__[1] is type(None)  # ty: ignore[possibly-missing-attribute]
 
     def test_name_caching_with_different_titles(self):
         """Ensure schemas with different titles create different cached classes"""
@@ -1277,9 +1277,9 @@ class TestNameHandling:
         result = validator.validate_python(
             {"name": "parent", "child": {"name": "child", "child": None}}
         )
-        assert result.name == "parent"
-        assert result.child.name == "child"
-        assert result.child.child is None
+        assert result.name == "parent"  # type: ignore[attr-defined]
+        assert result.child.name == "child"  # type: ignore[attr-defined]
+        assert result.child.child is None  # type: ignore[attr-defined]
 
 
 class TestAdditionalProperties:
@@ -1459,17 +1459,17 @@ class TestAdditionalProperties:
         result = validator.validate_python(data)
 
         # Check top-level extra field (BaseModel)
-        assert result.top_level_extra == "preserved"
+        assert result.top_level_extra == "preserved"  # type: ignore[attr-defined]
 
         # Check nested user extra field (BaseModel)
-        assert result.user.name == "Alice"
-        assert result.user.extra_user_field == "value"
+        assert result.user.name == "Alice"  # type: ignore[attr-defined]
+        assert result.user.extra_user_field == "value"  # type: ignore[attr-defined]
 
         # Check nested settings - should be dataclass
-        assert result.settings.theme == "dark"
+        assert result.settings.theme == "dark"  # type: ignore[attr-defined]
         # Note: When nested in BaseModel with extra='allow', Pydantic may preserve extra fields
         # even on dataclass children. The important thing is that settings is still a dataclass.
-        assert not issubclass(type(result.settings), BaseModel)
+        assert not issubclass(type(result.settings), BaseModel)  # type: ignore[attr-defined]
 
     def test_additional_properties_false_vs_missing(self):
         """Test difference between additionalProperties: false and missing additionalProperties"""
@@ -1511,9 +1511,9 @@ class TestAdditionalProperties:
 
         # Test with extra fields and defaults
         result = validator.validate_python({"extra": "field"})
-        assert result.name == "anonymous"
-        assert result.age == 0
-        assert result.extra == "field"
+        assert result.name == "anonymous"  # type: ignore[attr-defined]
+        assert result.age == 0  # type: ignore[attr-defined]
+        assert result.extra == "field"  # type: ignore[attr-defined]
 
     def test_additional_properties_type_consistency(self):
         """Test that the same schema always returns the same type"""
@@ -1569,8 +1569,7 @@ class TestFieldsWithDefaults:
         generated_type = json_schema_to_type(schema)
         validator = TypeAdapter(generated_type)
         result = validator.validate_python({})
-
-        assert result.flag is False
+        assert result.flag is False  # type: ignore[attr-defined]
 
     def test_field_with_default_accepts_explicit_value(self):
         """Test that fields with defaults accept explicit values."""
@@ -1582,5 +1581,4 @@ class TestFieldsWithDefaults:
         generated_type = json_schema_to_type(schema)
         validator = TypeAdapter(generated_type)
         result = validator.validate_python({"flag": True})
-
-        assert result.flag is True
+        assert result.flag is True  # type: ignore[attr-defined]

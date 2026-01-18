@@ -66,9 +66,10 @@ class TestEnvironment:
         env = config.environment
         assert env.python == "3.12"
         assert env.dependencies == ["requests", "numpy>=2.0"]
-        assert env.requirements == "requirements.txt"
-        assert env.project == "."
-        assert env.editable == ["../my-package"]
+        # Paths are stored as Path objects
+        assert env.requirements == Path("requirements.txt")
+        assert env.project == Path(".")
+        assert env.editable == [Path("../my-package")]
 
     def test_needs_uv(self):
         """Test needs_uv() method."""
@@ -112,12 +113,16 @@ class TestEnvironment:
         assert "--python" not in cmd
         assert "3.12" not in cmd
         assert "--project" in cmd
-        assert "." in cmd
+        # Project path should be resolved to absolute path
+        project_idx = cmd.index("--project")
+        assert Path(cmd[project_idx + 1]).is_absolute()
         assert "--with" in cmd
         assert "requests" in cmd
         assert "numpy" in cmd
         assert "--with-requirements" in cmd
-        assert "requirements.txt" in cmd
+        # Requirements path should be resolved to absolute path
+        req_idx = cmd.index("--with-requirements")
+        assert Path(cmd[req_idx + 1]).is_absolute()
         # Command args should be at the end
         assert "fastmcp" in cmd[-3:]
         assert "run" in cmd[-2:]
@@ -427,3 +432,30 @@ class TestMCPServerConfig:
             if field != "type"
         )
         assert config.deployment.transport == "http"
+
+
+class TestMCPServerConfigRoundtrip:
+    """Test that MCPServerConfig survives model_dump() -> reconstruct pattern.
+
+    This is used by the CLI to apply overrides immutably.
+    """
+
+    def test_roundtrip_preserves_schema(self):
+        """Ensure schema_ field survives dump/reconstruct cycle."""
+        config = MCPServerConfig(source=FileSystemSource(path="server.py"))
+        config_dict = config.model_dump()
+        reconstructed = MCPServerConfig(**config_dict)
+        assert reconstructed.schema_ == config.schema_
+
+    def test_roundtrip_with_all_fields(self):
+        """Full config survives dump/reconstruct."""
+        config = MCPServerConfig(
+            source=FileSystemSource(path="server.py", entrypoint="app"),
+            environment=UVEnvironment(python="3.11"),
+            deployment=Deployment(transport="http", port=8080),
+        )
+        config_dict = config.model_dump()
+        reconstructed = MCPServerConfig(**config_dict)
+        assert reconstructed.source.path == "server.py"
+        assert reconstructed.environment.python == "3.11"
+        assert reconstructed.deployment.port == 8080

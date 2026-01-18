@@ -8,27 +8,55 @@ sidebarTitle: prompt
 
 Base classes for FastMCP prompts.
 
-## Functions
-
-### `Message` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L31" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
-
-```python
-Message(content: str | ContentBlock, role: Role | None = None, **kwargs: Any) -> PromptMessage
-```
-
-
-A user-friendly constructor for PromptMessage.
-
-
 ## Classes
 
-### `PromptArgument` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L53" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+### `Message` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L40" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+
+Wrapper for prompt message with auto-serialization.
+
+Accepts any content - strings pass through, other types
+(dict, list, BaseModel) are JSON-serialized to text.
+
+
+**Methods:**
+
+#### `to_mcp_prompt_message` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L90" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+```python
+to_mcp_prompt_message(self) -> PromptMessage
+```
+
+Convert to MCP PromptMessage.
+
+
+### `PromptArgument` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L95" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 
 An argument that can be passed to a prompt.
 
 
-### `Prompt` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L65" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+### `PromptResult` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L107" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+
+Canonical result type for prompt rendering.
+
+Provides explicit control over prompt responses: multiple messages,
+roles, and metadata at both the message and result level.
+
+
+**Methods:**
+
+#### `to_mcp_prompt_result` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L179" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+```python
+to_mcp_prompt_result(self) -> GetPromptResult
+```
+
+Convert to MCP GetPromptResult.
+
+
+### `Prompt` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L189" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 
 A prompt template that can be rendered with parameters.
@@ -36,79 +64,82 @@ A prompt template that can be rendered with parameters.
 
 **Methods:**
 
-#### `enable` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L72" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `to_mcp_prompt` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L201" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
-enable(self) -> None
-```
-
-#### `disable` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L80" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
-
-```python
-disable(self) -> None
-```
-
-#### `to_mcp_prompt` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L88" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
-
-```python
-to_mcp_prompt(self, **overrides: Any) -> MCPPrompt
+to_mcp_prompt(self, **overrides: Any) -> SDKPrompt
 ```
 
 Convert the prompt to an MCP prompt.
 
 
-#### `from_function` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L115" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `from_function` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L227" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
-from_function(fn: Callable[..., PromptResult | Awaitable[PromptResult]], name: str | None = None, title: str | None = None, description: str | None = None, tags: set[str] | None = None, enabled: bool | None = None, meta: dict[str, Any] | None = None) -> FunctionPrompt
+from_function(cls, fn: Callable[..., Any]) -> FunctionPrompt
 ```
 
 Create a Prompt from a function.
 
 The function can return:
-- A string (converted to a message)
-- A Message object
-- A dict (converted to a message)
-- A sequence of any of the above
+- str: wrapped as single user Message
+- list\[Message | str]: converted to list\[Message]
+- PromptResult: used directly
 
 
-#### `render` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L143" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `render` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L263" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
-render(self, arguments: dict[str, Any] | None = None) -> list[PromptMessage]
+render(self, arguments: dict[str, Any] | None = None) -> str | list[Message | str] | PromptResult
 ```
 
 Render the prompt with arguments.
 
+Subclasses must implement this method. Return one of:
+- str: Wrapped as single user Message
+- list\[Message | str]: Converted to list\[Message]
+- PromptResult: Used directly
 
-### `FunctionPrompt` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L151" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
-
-A prompt that is a function.
-
-
-**Methods:**
-
-#### `from_function` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L157" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `convert_result` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L276" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
-from_function(cls, fn: Callable[..., PromptResult | Awaitable[PromptResult]], name: str | None = None, title: str | None = None, description: str | None = None, tags: set[str] | None = None, enabled: bool | None = None, meta: dict[str, Any] | None = None) -> FunctionPrompt
+convert_result(self, raw_value: Any) -> PromptResult
 ```
 
-Create a Prompt from a function.
+Convert a raw return value to PromptResult.
 
-The function can return:
-- A string (converted to a message)
-- A Message object
-- A dict (converted to a message)
-- A sequence of any of the above
+**Raises:**
+- `TypeError`: for unsupported types
 
 
-#### `render` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L317" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+#### `register_with_docket` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L366" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
-render(self, arguments: dict[str, Any] | None = None) -> list[PromptMessage]
+register_with_docket(self, docket: Docket) -> None
 ```
 
-Render the prompt with arguments.
+Register this prompt with docket for background execution.
 
+
+#### `add_to_docket` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L372" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+```python
+add_to_docket(self, docket: Docket, arguments: dict[str, Any] | None, **kwargs: Any) -> Execution
+```
+
+Schedule this prompt for background execution via docket.
+
+**Args:**
+- `docket`: The Docket instance
+- `arguments`: Prompt arguments
+- `fn_key`: Function lookup key in Docket registry (defaults to self.key)
+- `task_key`: Redis storage key for the result
+- `**kwargs`: Additional kwargs passed to docket.add()
+
+
+#### `get_span_attributes` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/prompts/prompt.py#L395" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+```python
+get_span_attributes(self) -> dict[str, Any]
+```

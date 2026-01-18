@@ -125,7 +125,7 @@ import asyncio
 
 async def main():
     # The client will automatically handle Google OAuth
-    async with Client("http://localhost:8000/mcp/", auth="oauth") as client:
+    async with Client("http://localhost:8000/mcp", auth="oauth") as client:
         # First-time connection will open Google login in your browser
         print("✓ Authenticated with Google!")
         
@@ -148,75 +148,43 @@ When you run the client for the first time:
 The client caches tokens locally, so you won't need to re-authenticate for subsequent runs unless the token expires or you explicitly clear the cache.
 </Info>
 
-## Environment Variables
+## Production Configuration
 
-<VersionBadge version="2.12.1" />
+<VersionBadge version="2.13.0" />
 
-For production deployments, use environment variables instead of hardcoding credentials.
-
-### Provider Selection
-
-Setting this environment variable allows the Google provider to be used automatically without explicitly instantiating it in code.
-
-<Card>
-<ParamField path="FASTMCP_SERVER_AUTH" default="Not set">
-Set to `fastmcp.server.auth.providers.google.GoogleProvider` to use Google authentication.
-</ParamField>
-</Card>
-
-### Google-Specific Configuration
-
-These environment variables provide default values for the Google provider, whether it's instantiated manually or configured via `FASTMCP_SERVER_AUTH`.
-
-<Card>
-<ParamField path="FASTMCP_SERVER_AUTH_GOOGLE_CLIENT_ID" required>
-Your Google OAuth 2.0 Client ID (e.g., `123456789.apps.googleusercontent.com`)
-</ParamField>
-
-<ParamField path="FASTMCP_SERVER_AUTH_GOOGLE_CLIENT_SECRET" required>
-Your Google OAuth 2.0 Client Secret (e.g., `GOCSPX-abc123...`)
-</ParamField>
-
-<ParamField path="FASTMCP_SERVER_AUTH_GOOGLE_BASE_URL" default="http://localhost:8000">
-Public URL of your FastMCP server for OAuth callbacks
-</ParamField>
-
-<ParamField path="FASTMCP_SERVER_AUTH_GOOGLE_REDIRECT_PATH" default="/auth/callback">
-Redirect path configured in your Google OAuth Client
-</ParamField>
-
-<ParamField path="FASTMCP_SERVER_AUTH_GOOGLE_REQUIRED_SCOPES" default="[]">
-Comma-, space-, or JSON-separated list of required Google scopes (e.g., `"openid,https://www.googleapis.com/auth/userinfo.email"` or `["openid", "https://www.googleapis.com/auth/userinfo.email"]`)
-</ParamField>
-
-<ParamField path="FASTMCP_SERVER_AUTH_GOOGLE_TIMEOUT_SECONDS" default="10">
-HTTP request timeout for Google API calls
-</ParamField>
-</Card>
-
-Example `.env` file:
-```bash
-# Use the Google provider
-FASTMCP_SERVER_AUTH=fastmcp.server.auth.providers.google.GoogleProvider
-
-# Google OAuth credentials
-FASTMCP_SERVER_AUTH_GOOGLE_CLIENT_ID=123456789.apps.googleusercontent.com
-FASTMCP_SERVER_AUTH_GOOGLE_CLIENT_SECRET=GOCSPX-abc123...
-FASTMCP_SERVER_AUTH_GOOGLE_BASE_URL=https://your-server.com
-FASTMCP_SERVER_AUTH_GOOGLE_REQUIRED_SCOPES=openid,https://www.googleapis.com/auth/userinfo.email
-```
-
-With environment variables set, your server code simplifies to:
+For production deployments with persistent token management across server restarts, configure `jwt_signing_key` and `client_storage`:
 
 ```python server.py
+import os
 from fastmcp import FastMCP
+from fastmcp.server.auth.providers.google import GoogleProvider
+from key_value.aio.stores.redis import RedisStore
+from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+from cryptography.fernet import Fernet
 
-# Authentication is automatically configured from environment
-mcp = FastMCP(name="Google Secured App")
+# Production setup with encrypted persistent token storage
+auth_provider = GoogleProvider(
+    client_id="123456789.apps.googleusercontent.com",
+    client_secret="GOCSPX-abc123...",
+    base_url="https://your-production-domain.com",
+    required_scopes=["openid", "https://www.googleapis.com/auth/userinfo.email"],
 
-@mcp.tool
-async def protected_tool(query: str) -> str:
-    """A tool that requires Google authentication to access."""
-    # Your tool implementation here
-    return f"Processing authenticated request: {query}"
+    # Production token management
+    jwt_signing_key=os.environ["JWT_SIGNING_KEY"],
+    client_storage=FernetEncryptionWrapper(
+        key_value=RedisStore(
+            host=os.environ["REDIS_HOST"],
+            port=int(os.environ["REDIS_PORT"])
+        ),
+        fernet=Fernet(os.environ["STORAGE_ENCRYPTION_KEY"])
+    )
+)
+
+mcp = FastMCP(name="Production Google App", auth=auth_provider)
 ```
+
+<Note>
+Parameters (`jwt_signing_key` and `client_storage`) work together to ensure tokens and client registrations survive server restarts. **Wrap your storage in `FernetEncryptionWrapper` to encrypt sensitive OAuth tokens at rest** - without it, tokens are stored in plaintext. Store secrets in environment variables and use a persistent storage backend like Redis for distributed deployments.
+
+For complete details on these parameters, see the [OAuth Proxy documentation](/servers/auth/oauth-proxy#configuration-parameters).
+</Note>

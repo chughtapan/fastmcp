@@ -15,7 +15,7 @@ Remote OAuth integration allows your FastMCP server to leverage external identit
 <Tip>
 **When to use RemoteAuthProvider vs OAuth Proxy:**
 - **RemoteAuthProvider**: For providers WITH Dynamic Client Registration (Descope, WorkOS AuthKit, modern OIDC providers)
-- **OAuth Proxy**: For providers WITHOUT Dynamic Client Registration (GitHub, Google, Azure, Discord, etc.)
+- **OAuth Proxy**: For providers WITHOUT Dynamic Client Registration (GitHub, Google, Azure, AWS, Discord, etc.)
 
 RemoteAuthProvider requires DCR support for fully automated client registration and authentication.
 </Tip>
@@ -86,7 +86,12 @@ FastMCP provides `RemoteAuthProvider` to handle the complexities of remote OAuth
 
 `RemoteAuthProvider` works by composing a [`TokenVerifier`](/servers/auth/token-verification) with authorization server information. A `TokenVerifier` is another FastMCP authentication class that focuses solely on token validation - signature verification, expiration checking, and claim extraction. The `RemoteAuthProvider` takes that token validation capability and adds the OAuth discovery endpoints that enable MCP clients to automatically find and authenticate with your identity provider.
 
-This composition pattern means you can use any token validation strategy (JWT verification, introspection endpoints, custom validation logic) while maintaining consistent OAuth discovery behavior. The separation allows you to change token validation approaches without affecting the client discovery experience.
+This composition pattern means you can use any token validation strategy while maintaining consistent OAuth discovery behavior:
+- **JWT tokens**: Use `JWTVerifier` for self-contained tokens
+- **Opaque tokens**: Use `IntrospectionTokenVerifier` for RFC 7662 introspection
+- **Custom validation**: Implement your own `TokenVerifier` subclass
+
+The separation allows you to change token validation approaches without affecting the client discovery experience.
 
 The class automatically generates the required OAuth metadata endpoints using the MCP SDK's standardized route creation functions. This ensures compatibility with MCP clients while reducing the implementation complexity for server developers.
 
@@ -112,7 +117,7 @@ auth = RemoteAuthProvider(
     token_verifier=token_verifier,
     authorization_servers=[AnyHttpUrl("https://auth.yourcompany.com")],
     base_url="https://api.yourcompany.com",  # Your server base URL
-    # Optional: customize allowed client redirect URIs (defaults to localhost only)
+    # Optional: restrict allowed client redirect URIs (defaults to all for DCR compatibility)
     allowed_client_redirect_uris=["http://localhost:*", "http://127.0.0.1:*"]
 )
 
@@ -199,9 +204,9 @@ WorkOS's support for Dynamic Client Registration makes it particularly well-suit
 <Note>
 `RemoteAuthProvider` also supports the `allowed_client_redirect_uris` parameter for controlling which redirect URIs are accepted from MCP clients during DCR:
 
-- `None` (default): Only localhost patterns allowed
+- `None` (default): All redirect URIs allowed (for DCR compatibility)
 - Custom list: Specify allowed patterns with wildcard support
-- Empty list `[]`: Allow all (not recommended)
+- Empty list `[]`: No redirect URIs allowed
 
 This provides defense-in-depth even though DCR providers typically validate redirect URIs themselves.
 </Note>

@@ -1,8 +1,5 @@
 """Tests for WorkOS OAuth provider."""
 
-import os
-from collections.abc import Generator
-from unittest.mock import patch
 from urllib.parse import urlparse
 
 import httpx
@@ -11,7 +8,7 @@ import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.server.auth.providers.workos import AuthKitProvider, WorkOSProvider
-from fastmcp.utilities.tests import HeadlessOAuth, run_server_in_process
+from fastmcp.utilities.tests import HeadlessOAuth, run_server_async
 
 
 class TestWorkOSProvider:
@@ -25,64 +22,12 @@ class TestWorkOSProvider:
             authkit_domain="https://test.authkit.app",
             base_url="https://myserver.com",
             required_scopes=["openid", "profile"],
+            jwt_signing_key="test-secret",
         )
 
         assert provider._upstream_client_id == "client_test123"
         assert provider._upstream_client_secret.get_secret_value() == "secret_test456"
         assert str(provider.base_url) == "https://myserver.com/"
-
-    @pytest.mark.parametrize(
-        "scopes_env",
-        [
-            "openid,email",
-            '["openid", "email"]',
-        ],
-    )
-    def test_init_with_env_vars(self, scopes_env):
-        """Test WorkOSProvider initialization from environment variables."""
-        with patch.dict(
-            os.environ,
-            {
-                "FASTMCP_SERVER_AUTH_WORKOS_CLIENT_ID": "env_client",
-                "FASTMCP_SERVER_AUTH_WORKOS_CLIENT_SECRET": "env_secret",
-                "FASTMCP_SERVER_AUTH_WORKOS_AUTHKIT_DOMAIN": "https://env.authkit.app",
-                "FASTMCP_SERVER_AUTH_WORKOS_BASE_URL": "https://envserver.com",
-                "FASTMCP_SERVER_AUTH_WORKOS_REQUIRED_SCOPES": scopes_env,
-            },
-        ):
-            provider = WorkOSProvider()
-
-            assert provider._upstream_client_id == "env_client"
-            assert provider._upstream_client_secret.get_secret_value() == "env_secret"
-            assert str(provider.base_url) == "https://envserver.com/"
-            assert provider._token_validator.required_scopes == [
-                "openid",
-                "email",
-            ]
-
-    def test_init_missing_client_id_raises_error(self):
-        """Test that missing client_id raises ValueError."""
-        with pytest.raises(ValueError, match="client_id is required"):
-            WorkOSProvider(
-                client_secret="test_secret",
-                authkit_domain="https://test.authkit.app",
-            )
-
-    def test_init_missing_client_secret_raises_error(self):
-        """Test that missing client_secret raises ValueError."""
-        with pytest.raises(ValueError, match="client_secret is required"):
-            WorkOSProvider(
-                client_id="test_client",
-                authkit_domain="https://test.authkit.app",
-            )
-
-    def test_init_missing_authkit_domain_raises_error(self):
-        """Test that missing authkit_domain raises ValueError."""
-        with pytest.raises(ValueError, match="authkit_domain is required"):
-            WorkOSProvider(
-                client_id="test_client",
-                client_secret="test_secret",
-            )
 
     def test_authkit_domain_https_prefix_handling(self):
         """Test that authkit_domain handles missing https:// prefix."""
@@ -92,6 +37,7 @@ class TestWorkOSProvider:
             client_secret="test_secret",
             authkit_domain="test.authkit.app",
             base_url="https://myserver.com",
+            jwt_signing_key="test-secret",
         )
         parsed = urlparse(provider1._upstream_authorization_endpoint)
         assert parsed.scheme == "https"
@@ -104,6 +50,7 @@ class TestWorkOSProvider:
             client_secret="test_secret",
             authkit_domain="https://test.authkit.app",
             base_url="https://myserver.com",
+            jwt_signing_key="test-secret",
         )
         parsed = urlparse(provider2._upstream_authorization_endpoint)
         assert parsed.scheme == "https"
@@ -116,6 +63,7 @@ class TestWorkOSProvider:
             client_secret="test_secret",
             authkit_domain="http://localhost:8080",
             base_url="https://myserver.com",
+            jwt_signing_key="test-secret",
         )
         parsed = urlparse(provider3._upstream_authorization_endpoint)
         assert parsed.scheme == "http"
@@ -128,10 +76,11 @@ class TestWorkOSProvider:
             client_id="test_client",
             client_secret="test_secret",
             authkit_domain="https://test.authkit.app",
+            base_url="https://myserver.com",
+            jwt_signing_key="test-secret",
         )
 
         # Check defaults
-        assert provider.base_url is None
         assert provider._redirect_path == "/auth/callback"
         # WorkOS provider has no default scopes but we can't easily verify without accessing internals
 
@@ -142,6 +91,7 @@ class TestWorkOSProvider:
             client_secret="test_secret",
             authkit_domain="https://test.authkit.app",
             base_url="https://myserver.com",
+            jwt_signing_key="test-secret",
         )
 
         # Check that endpoints use the authkit domain
@@ -157,7 +107,9 @@ class TestWorkOSProvider:
         )  # WorkOS doesn't support revocation
 
 
-def run_mcp_server(host: str, port: int) -> None:
+@pytest.fixture
+async def mcp_server_url():
+    """Start AuthKit server."""
     mcp = FastMCP(
         auth=AuthKitProvider(
             authkit_domain="https://respectful-lullaby-34-staging.authkit.app",
@@ -169,25 +121,17 @@ def run_mcp_server(host: str, port: int) -> None:
     def add(a: int, b: int) -> int:
         return a + b
 
-    mcp.run(host=host, port=port, transport="http")
+    async with run_server_async(mcp, transport="http") as url:
+        yield url
 
 
-@pytest.fixture(scope="module")
-def mcp_server_url() -> Generator[str]:
-    with run_server_in_process(run_mcp_server) as url:
-        yield f"{url}/mcp"
-
-
-@pytest.fixture()
-def client_with_headless_oauth(
-    mcp_server_url: str,
-) -> Generator[Client, None, None]:
+@pytest.fixture
+def client_with_headless_oauth(mcp_server_url: str) -> Client:
     """Client with headless OAuth that bypasses browser interaction."""
-    client = Client(
+    return Client(
         transport=StreamableHttpTransport(mcp_server_url),
         auth=HeadlessOAuth(mcp_url=mcp_server_url),
     )
-    yield client
 
 
 class TestAuthKitProvider:

@@ -1,7 +1,22 @@
-from collections.abc import Callable
+import asyncio
+import socket
+import sys
+from collections.abc import Callable, Generator
+from pathlib import Path
 from typing import Any
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+from fastmcp.utilities.tests import temporary_settings
+
+# Use SelectorEventLoop on Windows to avoid ProactorEventLoop crashes
+# See: https://github.com/python/cpython/issues/116773
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 def pytest_collection_modifyitems(items):
@@ -20,5 +35,79 @@ def import_rich_rule():
     yield
 
 
+@pytest.fixture(autouse=True)
+def isolate_settings_home(tmp_path: Path):
+    """Ensure each test uses an isolated settings.home directory.
+
+    This prevents SQLite database locking issues on Windows when multiple
+    tests share the same DiskStore directory in settings.home / "oauth-proxy".
+    """
+    test_home = tmp_path / "fastmcp-test-home"
+    test_home.mkdir(exist_ok=True)
+
+    with temporary_settings(home=test_home):
+        yield
+
+
 def get_fn_name(fn: Callable[..., Any]) -> str:
     return fn.__name__  # ty: ignore[unresolved-attribute]
+
+
+@pytest.fixture
+def worker_id(request):
+    """Get the xdist worker ID, or 'master' if not using xdist."""
+    return getattr(request.config, "workerinput", {}).get("workerid", "master")
+
+
+@pytest.fixture
+def free_port():
+    """Get a free port for the test to use."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
+
+
+@pytest.fixture
+def free_port_factory(worker_id):
+    """Factory to get free ports that tracks used ports per test session."""
+    used_ports = set()
+
+    def get_port():
+        while True:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                s.listen(1)
+                port = s.getsockname()[1]
+                if port not in used_ports:
+                    used_ports.add(port)
+                    return port
+
+    return get_port
+
+
+@pytest.fixture(scope="session")
+def otel_trace_provider() -> Generator[
+    tuple[TracerProvider, InMemorySpanExporter], None, None
+]:
+    """Configure OTEL SDK with in-memory span exporter for testing.
+
+    Session-scoped because TracerProvider can only be set once per process.
+    """
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+    yield provider, exporter
+
+
+@pytest.fixture
+def trace_exporter(
+    otel_trace_provider: tuple[TracerProvider, InMemorySpanExporter],
+) -> Generator[InMemorySpanExporter, None, None]:
+    """Get the span exporter and clear it between tests."""
+    _, exporter = otel_trace_provider
+    exporter.clear()
+    yield exporter
+    exporter.clear()

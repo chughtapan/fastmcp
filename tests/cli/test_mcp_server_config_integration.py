@@ -84,7 +84,6 @@ class TestConfigFileDetection:
 class TestConfigWithClient:
     """Test fastmcp.json configuration with client connections."""
 
-    @pytest.mark.asyncio
     async def test_config_server_with_client(self, server_with_config):
         """Test that a server loaded from config works with a client."""
         # Load the config
@@ -137,7 +136,7 @@ class TestEnvironmentExecution:
         """Test that environment with dependencies needs UV."""
         config = MCPServerConfig(
             source={"path": "server.py"},
-            environment={"dependencies": ["requests", "numpy"]},  # type: ignore[arg-type]
+            environment={"dependencies": ["requests", "numpy"]},
         )
 
         assert config.environment is not None
@@ -147,7 +146,7 @@ class TestEnvironmentExecution:
         """Test that environment with Python version needs UV."""
         config = MCPServerConfig(
             source={"path": "server.py"},
-            environment={"python": "3.12"},  # type: ignore[arg-type]
+            environment={"python": "3.12"},
         )
 
         assert config.environment is not None
@@ -165,7 +164,7 @@ class TestEnvironmentExecution:
         """Test that no UV is needed with empty environment config."""
         config = MCPServerConfig(
             source={"path": "server.py"},
-            environment={},  # type: ignore[arg-type]
+            environment={},
         )
 
         assert config.environment is not None
@@ -203,7 +202,7 @@ class TestPathResolution:
 
         config = MCPServerConfig(
             source={"path": "server.py"},
-            deployment={"cwd": "work"},  # type: ignore[arg-type]
+            deployment={"cwd": "work"},
         )
 
         original_cwd = os.getcwd()
@@ -227,17 +226,18 @@ class TestPathResolution:
 
         config = MCPServerConfig(
             source={"path": "server.py"},
-            environment={"requirements": "requirements.txt"},  # type: ignore[arg-type]
+            environment={"requirements": "requirements.txt"},
         )
 
         # Build UV command
         assert config.environment is not None
         uv_cmd = config.environment.build_command(["fastmcp", "run"])
 
-        # Should include requirements file
+        # Should include requirements file with absolute path
         assert "--with-requirements" in uv_cmd
         req_idx = uv_cmd.index("--with-requirements") + 1
-        assert uv_cmd[req_idx] == "requirements.txt"
+        assert Path(uv_cmd[req_idx]).is_absolute()
+        assert Path(uv_cmd[req_idx]).name == "requirements.txt"
 
 
 class TestConfigValidation:
@@ -248,14 +248,14 @@ class TestConfigValidation:
         with pytest.raises(ValueError):
             MCPServerConfig(
                 source={"path": "server.py"},
-                deployment={"transport": "invalid_transport"},  # type: ignore[arg-type]
+                deployment={"transport": "invalid_transport"},
             )
 
     def test_streamable_http_transport_accepted(self):
         """Test that streamable-http transport is accepted as a valid value."""
         config = MCPServerConfig(
             source={"path": "server.py"},
-            deployment={"transport": "streamable-http"},  # type: ignore[arg-type]
+            deployment={"transport": "streamable-http"},
         )
         assert config.deployment.transport == "streamable-http"
 
@@ -264,7 +264,7 @@ class TestConfigValidation:
         with pytest.raises(ValueError):
             MCPServerConfig(
                 source={"path": "server.py"},
-                deployment={"log_level": "INVALID"},  # type: ignore[arg-type]
+                deployment={"log_level": "INVALID"},
             )
 
     def test_missing_source_rejected(self):
@@ -277,7 +277,7 @@ class TestConfigValidation:
         for transport in ["stdio", "http", "sse"]:
             config = MCPServerConfig(
                 source={"path": "server.py"},
-                deployment={"transport": transport},  # type: ignore[arg-type]
+                deployment={"transport": transport},
             )
             assert config.deployment is not None
             assert config.deployment.transport == transport
@@ -287,7 +287,7 @@ class TestConfigValidation:
         for level in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
             config = MCPServerConfig(
                 source={"path": "server.py"},
-                deployment={"log_level": level},  # type: ignore[arg-type]
+                deployment={"log_level": level},
             )
             assert config.deployment is not None
             assert config.deployment.log_level == level

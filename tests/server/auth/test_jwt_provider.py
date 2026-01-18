@@ -1,4 +1,4 @@
-from collections.abc import Generator
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
@@ -8,7 +8,7 @@ from pytest_httpx import HTTPXMock
 from fastmcp import Client, FastMCP
 from fastmcp.client.auth.bearer import BearerAuth
 from fastmcp.server.auth.providers.jwt import JWKData, JWKSData, JWTVerifier, RSAKeyPair
-from fastmcp.utilities.tests import run_server_in_process
+from fastmcp.utilities.tests import run_server_async
 
 
 class SymmetricKeyHelper:
@@ -111,13 +111,10 @@ def symmetric_provider(symmetric_key_helper: SymmetricKeyHelper) -> JWTVerifier:
     )
 
 
-def run_mcp_server(
+def create_mcp_server(
     public_key: str,
-    host: str,
-    port: int,
     auth_kwargs: dict[str, Any] | None = None,
-    run_kwargs: dict[str, Any] | None = None,
-) -> None:
+) -> FastMCP:
     mcp = FastMCP(
         auth=JWTVerifier(
             public_key=public_key,
@@ -129,21 +126,20 @@ def run_mcp_server(
     def add(a: int, b: int) -> int:
         return a + b
 
-    mcp.run(host=host, port=port, **run_kwargs or {})
+    return mcp
 
 
-@pytest.fixture(scope="module")
-def mcp_server_url(rsa_key_pair: RSAKeyPair) -> Generator[str]:
-    with run_server_in_process(
-        run_mcp_server,
+@pytest.fixture
+async def mcp_server_url(rsa_key_pair: RSAKeyPair) -> AsyncGenerator[str, None]:
+    server = create_mcp_server(
         public_key=rsa_key_pair.public_key,
         auth_kwargs=dict(
             issuer="https://test.example.com",
             audience="https://api.example.com",
         ),
-        run_kwargs=dict(transport="http"),
-    ) as url:
-        yield f"{url}/mcp"
+    )
+    async with run_server_async(server, transport="http") as url:
+        yield url
 
 
 class TestRSAKeyPair:
@@ -399,8 +395,8 @@ class TestBearerTokenJWKS:
         from authlib.jose import JsonWebKey
 
         # Create JWK from the RSA public key
-        jwk = JsonWebKey.import_key(rsa_key_pair.public_key)  # type: ignore
-        jwk_data: JWKData = jwk.as_dict()  # type: ignore
+        jwk = JsonWebKey.import_key(rsa_key_pair.public_key)
+        jwk_data: JWKData = jwk.as_dict()
         jwk_data["kid"] = "test-key-1"
         jwk_data["alg"] = "RS256"
 
@@ -554,7 +550,7 @@ class TestBearerTokenJWKS:
         mock_jwks_data: JWKSData,
         httpx_mock: HTTPXMock,
     ):
-        mock_jwks_data["keys"] = [
+        mock_jwks_data["keys"] = [  # type: ignore[typeddict-item]
             {
                 "kid": "test-key-1",
                 "alg": "RS256",
@@ -766,6 +762,29 @@ class TestBearerToken:
         )
         access_token3 = await provider.load_access_token(token3)
         assert access_token3 is None
+
+    @pytest.mark.parametrize(
+        ("iss", "expected"),
+        [
+            ("https://test.example.com", True),
+            ("https://other-issuer.example.com", True),
+            ("https://wrong-issuer.example.com", False),
+        ],
+    )
+    async def test_provider_with_multiple_expected_issuers(
+        self, rsa_key_pair: RSAKeyPair, iss: str, expected: bool
+    ):
+        """Provider accepts any issuer from the configured list."""
+        provider = JWTVerifier(
+            public_key=rsa_key_pair.public_key,
+            issuer=["https://test.example.com", "https://other-issuer.example.com"],
+            audience="https://api.example.com",
+        )
+        token = rsa_key_pair.create_token(
+            subject="test-user", issuer=iss, audience="https://api.example.com"
+        )
+        access_token = await provider.load_access_token(token)
+        assert (access_token is not None) is expected
 
     async def test_scope_extraction_string(
         self, rsa_key_pair: RSAKeyPair, bearer_provider: JWTVerifier
@@ -1021,9 +1040,7 @@ class TestFastMCPBearerAuth:
         assert exc_info.value.response.status_code == 401
         assert "tools" not in locals()
 
-    async def test_token_with_insufficient_scopes(
-        self, mcp_server_url: str, rsa_key_pair: RSAKeyPair
-    ):
+    async def test_token_with_insufficient_scopes(self, rsa_key_pair: RSAKeyPair):
         token = rsa_key_pair.create_token(
             subject="test-user",
             issuer="https://test.example.com",
@@ -1031,13 +1048,12 @@ class TestFastMCPBearerAuth:
             scopes=["read"],
         )
 
-        with run_server_in_process(
-            run_mcp_server,
+        server = create_mcp_server(
             public_key=rsa_key_pair.public_key,
             auth_kwargs=dict(required_scopes=["read", "write"]),
-            run_kwargs=dict(transport="http"),
-        ) as url:
-            mcp_server_url = f"{url}/mcp/"
+        )
+
+        async with run_server_async(server, transport="http") as mcp_server_url:
             with pytest.raises(httpx.HTTPStatusError) as exc_info:
                 async with Client(mcp_server_url, auth=BearerAuth(token)) as client:
                     tools = await client.list_tools()  # noqa: F841
@@ -1048,9 +1064,7 @@ class TestFastMCPBearerAuth:
             assert exc_info.value.response.status_code == 401
             assert "tools" not in locals()
 
-    async def test_token_with_sufficient_scopes(
-        self, mcp_server_url: str, rsa_key_pair: RSAKeyPair
-    ):
+    async def test_token_with_sufficient_scopes(self, rsa_key_pair: RSAKeyPair):
         token = rsa_key_pair.create_token(
             subject="test-user",
             issuer="https://test.example.com",
@@ -1058,16 +1072,15 @@ class TestFastMCPBearerAuth:
             scopes=["read", "write"],
         )
 
-        with run_server_in_process(
-            run_mcp_server,
+        server = create_mcp_server(
             public_key=rsa_key_pair.public_key,
             auth_kwargs=dict(required_scopes=["read", "write"]),
-            run_kwargs=dict(transport="http"),
-        ) as url:
-            mcp_server_url = f"{url}/mcp/"
+        )
+
+        async with run_server_async(server, transport="http") as mcp_server_url:
             async with Client(mcp_server_url, auth=BearerAuth(token)) as client:
                 tools = await client.list_tools()
-        assert tools
+            assert tools
 
 
 class TestJWTVerifierImport:

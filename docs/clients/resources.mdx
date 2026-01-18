@@ -22,42 +22,46 @@ MCP servers expose two types of resources:
 
 ### Static Resources
 
-Use `list_resources()` to retrieve all static resources available on the server:
+Use `list_resources()` to retrieve all static resources available on the server. When the server paginates results, the client automatically fetches all pages and returns the complete list.
 
 ```python
 async with client:
     resources = await client.list_resources()
     # resources -> list[mcp.types.Resource]
-    
+
     for resource in resources:
         print(f"Resource URI: {resource.uri}")
         print(f"Name: {resource.name}")
         print(f"Description: {resource.description}")
         print(f"MIME Type: {resource.mimeType}")
         # Access tags and other metadata
-        if hasattr(resource, '_meta') and resource._meta:
-            fastmcp_meta = resource._meta.get('_fastmcp', {})
+        if resource.meta:
+            fastmcp_meta = resource.meta.get('fastmcp', {})
             print(f"Tags: {fastmcp_meta.get('tags', [])}")
 ```
 
+For manual pagination control, use `list_resources_mcp()` with the `cursor` parameter. See [Pagination](/servers/pagination#manual-pagination) for details.
+
 ### Resource Templates
 
-Use `list_resource_templates()` to retrieve available resource templates:
+Use `list_resource_templates()` to retrieve available resource templates. When the server paginates results, the client automatically fetches all pages and returns the complete list.
 
 ```python
 async with client:
     templates = await client.list_resource_templates()
     # templates -> list[mcp.types.ResourceTemplate]
-    
+
     for template in templates:
         print(f"Template URI: {template.uriTemplate}")
         print(f"Name: {template.name}")
         print(f"Description: {template.description}")
         # Access tags and other metadata
-        if hasattr(template, '_meta') and template._meta:
-            fastmcp_meta = template._meta.get('_fastmcp', {})
+        if template.meta:
+            fastmcp_meta = template.meta.get('fastmcp', {})
             print(f"Tags: {fastmcp_meta.get('tags', [])}")
 ```
+
+For manual pagination control, use `list_resource_templates_mcp()` with the `cursor` parameter. See [Pagination](/servers/pagination#manual-pagination) for details.
 
 ### Filtering by Tags
 
@@ -72,17 +76,43 @@ async with client:
     # Filter resources by tag
     config_resources = [
         resource for resource in resources 
-        if hasattr(resource, '_meta') and resource._meta and
-           resource._meta.get('_fastmcp', {}) and
-           'config' in resource._meta.get('_fastmcp', {}).get('tags', [])
+        if resource.meta and
+           resource.meta.get('fastmcp', {}) and
+           'config' in resource.meta.get('fastmcp', {}).get('tags', [])
     ]
     
     print(f"Found {len(config_resources)} config resources")
 ```
 
 <Note>
-The `_meta` field is part of the standard MCP specification. FastMCP servers include tags and other metadata within a `_fastmcp` namespace (e.g., `_meta._fastmcp.tags`) to avoid conflicts with user-defined metadata. This behavior can be controlled with the server's `include_fastmcp_meta` setting - when disabled, the `_fastmcp` namespace won't be included. Other MCP server implementations may not provide this metadata structure.
+The `meta` field is part of the standard MCP specification. FastMCP servers always include tags and other metadata within a `fastmcp` namespace (e.g., `meta.fastmcp.tags`) to avoid conflicts with user-defined metadata. For versioned resources, `meta.fastmcp.version` shows the current version and `meta.fastmcp.versions` lists all available versions. Other MCP server implementations may not provide this metadata structure.
 </Note>
+
+### Version Information
+
+<VersionBadge version="3.0.0" />
+
+When a server registers multiple versions of a resource, the metadata includes version information.
+
+```python
+async with client:
+    resources = await client.list_resources()
+
+    for resource in resources:
+        if resource.meta:
+            fastmcp_meta = resource.meta.get("fastmcp", {})
+            version = fastmcp_meta.get("version")
+            all_versions = fastmcp_meta.get("versions")
+            if all_versions:
+                print(f"{resource.uri}: v{version} (available: {all_versions})")
+```
+
+To read a specific version, use the `version` parameter:
+
+```python
+# Read a specific version
+content = await client.read_resource("data://config", version="1.0")
+```
 
 ## Reading Resources
 

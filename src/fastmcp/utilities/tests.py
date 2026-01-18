@@ -5,13 +5,14 @@ import logging
 import multiprocessing
 import socket
 import time
-from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from collections.abc import AsyncGenerator, Callable, Generator
+from contextlib import asynccontextmanager, contextmanager, suppress
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import uvicorn
+from pytest import LogCaptureFixture
 
 from fastmcp import settings
 from fastmcp.client.auth.oauth import OAuth
@@ -66,6 +67,7 @@ def _run_server(mcp_server: FastMCP, transport: Literal["sse"], port: int) -> No
             host="127.0.0.1",
             port=port,
             log_level="error",
+            ws="websockets-sansio",
         )
     )
     uvicorn_server.run()
@@ -74,11 +76,11 @@ def _run_server(mcp_server: FastMCP, transport: Literal["sse"], port: int) -> No
 @contextmanager
 def run_server_in_process(
     server_fn: Callable[..., None],
-    *args,
+    *args: Any,
     provide_host_and_port: bool = True,
     host: str = "127.0.0.1",
     port: int | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> Generator[str, None, None]:
     """
     Context manager that runs a FastMCP server in a separate process and
@@ -109,7 +111,7 @@ def run_server_in_process(
     proc.start()
 
     # Wait for server to be running
-    max_attempts = 10
+    max_attempts = 30
     attempt = 0
     while attempt < max_attempts and proc.is_alive():
         try:
@@ -117,10 +119,12 @@ def run_server_in_process(
                 s.connect((host, port))
                 break
         except ConnectionRefusedError:
-            if attempt < 3:
-                time.sleep(0.01)
-            else:
+            if attempt < 5:
+                time.sleep(0.05)
+            elif attempt < 15:
                 time.sleep(0.1)
+            else:
+                time.sleep(0.2)
             attempt += 1
     else:
         raise RuntimeError(f"Server failed to start after {max_attempts} attempts")
@@ -137,14 +141,99 @@ def run_server_in_process(
             raise RuntimeError("Server process failed to terminate even after kill")
 
 
+@asynccontextmanager
+async def run_server_async(
+    server: FastMCP,
+    port: int | None = None,
+    transport: Literal["http", "streamable-http", "sse"] = "http",
+    path: str = "/mcp",
+    host: str = "127.0.0.1",
+) -> AsyncGenerator[str, None]:
+    """
+    Start a FastMCP server as an asyncio task for in-process async testing.
+
+    This is the recommended way to test FastMCP servers. It runs the server
+    as an async task in the same process, eliminating subprocess coordination,
+    sleeps, and cleanup issues.
+
+    Args:
+        server: FastMCP server instance
+        port: Port to bind to (default: find available port)
+        transport: Transport type ("http", "streamable-http", or "sse")
+        path: URL path for the server (default: "/mcp")
+        host: Host to bind to (default: "127.0.0.1")
+
+    Yields:
+        Server URL string
+
+    Example:
+        ```python
+        import pytest
+        from fastmcp import FastMCP, Client
+        from fastmcp.client.transports import StreamableHttpTransport
+        from fastmcp.utilities.tests import run_server_async
+
+        @pytest.fixture
+        async def server():
+            mcp = FastMCP("test")
+
+            @mcp.tool()
+            def greet(name: str) -> str:
+                return f"Hello, {name}!"
+
+            async with run_server_async(mcp) as url:
+                yield url
+
+        async def test_greet(server: str):
+            async with Client(StreamableHttpTransport(server)) as client:
+                result = await client.call_tool("greet", {"name": "World"})
+                assert result.content[0].text == "Hello, World!"
+        ```
+    """
+    import asyncio
+
+    if port is None:
+        port = find_available_port()
+
+    # Wait a tiny bit for the port to be released if it was just used
+    await asyncio.sleep(0.01)
+
+    # Start server as a background task
+    server_task = asyncio.create_task(
+        server.run_http_async(
+            host=host,
+            port=port,
+            transport=transport,
+            path=path,
+            show_banner=False,
+        )
+    )
+
+    # Wait for server lifespan to be ready
+    await server._started.wait()
+
+    # Give uvicorn a moment to bind the port after lifespan is ready
+    await asyncio.sleep(0.1)
+
+    try:
+        yield f"http://{host}:{port}{path}"
+    finally:
+        # Cleanup: cancel the task with timeout to avoid hanging on Windows
+        server_task.cancel()
+        with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(server_task, timeout=2.0)
+
+
 @contextmanager
-def caplog_for_fastmcp(caplog):
+def caplog_for_fastmcp(
+    caplog: LogCaptureFixture,
+) -> Generator[LogCaptureFixture, None, None]:
     """Context manager to capture logs from FastMCP loggers even when propagation is disabled."""
     caplog.clear()
-    logger = logging.getLogger("FastMCP")
+    logger = logging.getLogger("fastmcp")
     logger.addHandler(caplog.handler)
     try:
-        yield
+        yield caplog
     finally:
         logger.removeHandler(caplog.handler)
 

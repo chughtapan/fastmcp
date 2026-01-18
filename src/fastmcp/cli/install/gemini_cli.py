@@ -104,13 +104,12 @@ def install_gemini_cli(
         )
         return False
 
-    # Build uv run command using Environment.build_uv_run_command()
     env_config = UVEnvironment(
         python=python_version,
         dependencies=(with_packages or []) + ["fastmcp"],
-        requirements=str(with_requirements) if with_requirements else None,
-        project=str(project) if project else None,
-        editable=[str(p) for p in with_editable] if with_editable else None,
+        requirements=with_requirements,
+        project=project,
+        editable=with_editable,
     )
 
     # Build server spec from parsed components
@@ -163,15 +162,12 @@ async def gemini_cli_command(
         cyclopts.Parameter(
             "--with-editable",
             help="Directory with pyproject.toml to install in editable mode (can be used multiple times)",
-            negative="",
         ),
     ] = None,
     with_packages: Annotated[
         list[str] | None,
         cyclopts.Parameter(
-            "--with",
-            help="Additional packages to install (can be used multiple times)",
-            negative="",
+            "--with", help="Additional packages to install (can be used multiple times)"
         ),
     ] = None,
     env_vars: Annotated[
@@ -179,7 +175,6 @@ async def gemini_cli_command(
         cyclopts.Parameter(
             "--env",
             help="Environment variables in KEY=VALUE format (can be used multiple times)",
-            negative="",
         ),
     ] = None,
     env_file: Annotated[

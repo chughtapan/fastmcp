@@ -1,6 +1,13 @@
 <div align="center">
 
 <!-- omit in toc -->
+
+<picture>
+  <source width="550" media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/wordmark-watercolor-waves-dark.png">
+  <source width="550" media="(prefers-color-scheme: light)" srcset="docs/assets/brand/wordmark-watercolor-waves.png">
+  <img width="550" alt="FastMCP Logo" src="docs/assets/brand/wordmark-watercolor-waves.png">
+</picture>
+
 # FastMCP v2 🚀
 
 <strong>The fast, Pythonic way to build MCP servers and clients.</strong>
@@ -8,6 +15,7 @@
 *Made with ☕️ by [Prefect](https://www.prefect.io/)*
 
 [![Docs](https://img.shields.io/badge/docs-gofastmcp.com-blue)](https://gofastmcp.com)
+[![Discord](https://img.shields.io/badge/community-discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/uu8dJCgttd)
 [![PyPI - Version](https://img.shields.io/pypi/v/fastmcp.svg)](https://pypi.org/project/fastmcp)
 [![Tests](https://github.com/jlowin/fastmcp/actions/workflows/run-tests.yml/badge.svg)](https://github.com/jlowin/fastmcp/actions/workflows/run-tests.yml)
 [![License](https://img.shields.io/github/license/jlowin/fastmcp.svg)](https://github.com/jlowin/fastmcp/blob/main/LICENSE)
@@ -17,19 +25,22 @@
 
 > [!Note]
 >
-> #### Beyond the Protocol
+> #### FastMCP 2.0: The Standard Framework
 >
-> FastMCP is the standard framework for working with the Model Context Protocol. FastMCP 1.0 was incorporated into the [official MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) in 2024.
+> FastMCP pioneered Python MCP development, and FastMCP 1.0 was incorporated into the [official MCP SDK](https://github.com/modelcontextprotocol/python-sdk) in 2024.
 >
-> This is FastMCP 2.0, the **actively maintained version** that provides a complete toolkit for working with the MCP ecosystem.
+> **This is FastMCP 2.0** — the actively maintained, production-ready framework that extends far beyond basic protocol implementation. While the SDK provides core functionality, FastMCP 2.0 delivers everything needed for production: advanced MCP patterns (server composition, proxying, OpenAPI/FastAPI generation, tool transformation), enterprise auth (Google, GitHub, WorkOS, Azure, Auth0, and more), deployment tools, testing utilities, and comprehensive client libraries.
 >
-> FastMCP 2.0 has a comprehensive set of features that go far beyond the core MCP specification, all in service of providing **the simplest path to production**. These include deployment, auth, clients, server proxying and composition, generating servers from REST APIs, dynamic tool rewriting, built-in testing tools, integrations, and more.
->
-> Ready to upgrade or get started? Follow the [installation instructions](https://gofastmcp.com/getting-started/installation), which include steps for upgrading from the official MCP SDK.
+> **For production MCP applications, install FastMCP:** `pip install fastmcp`
+
+> [!Important]
+> FastMCP 3.0 is in development and may include some breaking changes. To avoid unexpected issues, pin your dependency to v2: `fastmcp<3`
 
 ---
 
-The [Model Context Protocol (MCP)](https://modelcontextprotocol.io) is a new, standardized way to provide context and tools to your LLMs, and FastMCP makes building MCP servers and clients simple and intuitive. Create tools, expose resources, define prompts, and connect components with clean, Pythonic code.
+**FastMCP is the standard framework for building MCP applications**, providing the fastest path from idea to production.
+
+The [Model Context Protocol (MCP)](https://modelcontextprotocol.io) is a standardized way to provide context and tools to LLMs. FastMCP makes building production-ready MCP servers simple, with enterprise auth, deployment tools, and a complete ecosystem built in.
 
 ```python
 # server.py
@@ -63,33 +74,40 @@ There are two ways to access the LLM-friendly documentation:
 - [`llms.txt`](https://gofastmcp.com/llms.txt) is essentially a sitemap, listing all the pages in the documentation.
 - [`llms-full.txt`](https://gofastmcp.com/llms-full.txt) contains the entire documentation. Note this may exceed the context window of your LLM.
 
+**Community:** Join our [Discord server](https://discord.gg/uu8dJCgttd) to connect with other FastMCP developers and share what you're building.
+
 ---
 
 <!-- omit in toc -->
 ## Table of Contents
 
-- [What is MCP?](#what-is-mcp)
-- [Why FastMCP?](#why-fastmcp)
-- [Installation](#installation)
-- [Core Concepts](#core-concepts)
-  - [The `FastMCP` Server](#the-fastmcp-server)
-  - [Tools](#tools)
-  - [Resources \& Templates](#resources--templates)
-  - [Prompts](#prompts)
-  - [Context](#context)
-  - [MCP Clients](#mcp-clients)
-- [Advanced Features](#advanced-features)
-  - [Proxy Servers](#proxy-servers)
-  - [Composing MCP Servers](#composing-mcp-servers)
-  - [OpenAPI \& FastAPI Generation](#openapi--fastapi-generation)
-  - [Authentication \& Security](#authentication--security)
-- [Running Your Server](#running-your-server)
-- [Contributing](#contributing)
-  - [Prerequisites](#prerequisites)
-  - [Setup](#setup)
-  - [Unit Tests](#unit-tests)
-  - [Static Checks](#static-checks)
-  - [Pull Requests](#pull-requests)
+- [FastMCP v2 🚀](#fastmcp-v2-)
+    - [📚 Documentation](#-documentation)
+  - [What is MCP?](#what-is-mcp)
+  - [Why FastMCP?](#why-fastmcp)
+  - [Installation](#installation)
+  - [Core Concepts](#core-concepts)
+    - [The `FastMCP` Server](#the-fastmcp-server)
+    - [Tools](#tools)
+    - [Resources \& Templates](#resources--templates)
+    - [Prompts](#prompts)
+    - [Context](#context)
+    - [MCP Clients](#mcp-clients)
+  - [Authentication](#authentication)
+    - [Enterprise Authentication, Zero Configuration](#enterprise-authentication-zero-configuration)
+  - [Deployment](#deployment)
+    - [From Development to Production](#from-development-to-production)
+  - [Advanced Features](#advanced-features)
+    - [Proxy Servers](#proxy-servers)
+    - [Composing MCP Servers](#composing-mcp-servers)
+    - [OpenAPI \& FastAPI Generation](#openapi--fastapi-generation)
+  - [Running Your Server](#running-your-server)
+  - [Contributing](#contributing)
+    - [Prerequisites](#prerequisites)
+    - [Setup](#setup)
+    - [Unit Tests](#unit-tests)
+    - [Static Checks](#static-checks)
+    - [Pull Requests](#pull-requests)
 
 ---
 
@@ -106,11 +124,7 @@ FastMCP provides a high-level, Pythonic interface for building, managing, and in
 
 ## Why FastMCP?
 
-The MCP protocol is powerful but implementing it involves a lot of boilerplate - server setup, protocol handlers, content types, error management. FastMCP handles all the complex protocol details and server management, so you can focus on building great tools. It's designed to be high-level and Pythonic; in most cases, decorating a function is all you need.
-
-FastMCP 2.0 has evolved into a comprehensive platform that goes far beyond basic protocol implementation. While 1.0 provided server-building capabilities (and is now part of the official MCP SDK), 2.0 offers a complete ecosystem including client libraries, authentication systems, deployment tools, integrations with major AI platforms, testing frameworks, and production-ready infrastructure patterns.
-
-FastMCP aims to be:
+FastMCP handles all the complex protocol details so you can focus on building. In most cases, decorating a Python function is all you need — FastMCP handles the rest.
 
 🚀 **Fast:** High-level interface means less code and faster development
 
@@ -118,7 +132,9 @@ FastMCP aims to be:
 
 🐍 **Pythonic:** Feels natural to Python developers
 
-🔍 **Complete:** A comprehensive platform for all MCP use cases, from dev to prod
+🔍 **Complete:** Everything for production — enterprise auth (Google, GitHub, Azure, Auth0, WorkOS), deployment tools, testing frameworks, client libraries, and more
+
+FastMCP provides the shortest path from idea to production. Deploy locally, to the cloud with [FastMCP Cloud](https://fastmcp.cloud), or to your own infrastructure.
 
 ## Installation
 
@@ -129,6 +145,8 @@ uv pip install fastmcp
 ```
 
 For full installation instructions, including verification, upgrading from the official MCPSDK, and developer setup, see the [**Installation Guide**](https://gofastmcp.com/getting-started/installation).
+
+**Dependency Licensing:** FastMCP depends on Cyclopts for CLI functionality. Cyclopts v4 includes docutils as a transitive dependency, which has complex licensing that may trigger compliance reviews in some organizations. If this is a concern, you can install Cyclopts v5 alpha (`pip install "cyclopts>=5.0.0a1"`) which removes this dependency, or wait for the stable v5 release. See [this issue](https://github.com/BrianPugh/cyclopts/issues/672) for details.
 
 ## Core Concepts
 
@@ -145,7 +163,7 @@ from fastmcp import FastMCP
 mcp = FastMCP(name="MyAssistantServer")
 ```
 
-Learn more in the [**FastMCP Server Documentation**](https://gofastmcp.com/servers/fastmcp).
+Learn more in the [**FastMCP Server Documentation**](https://gofastmcp.com/servers/server).
 
 ### Tools
 
@@ -198,7 +216,6 @@ Access MCP session capabilities within your tools, resources, or prompts by addi
 
 - **Logging:** Log messages to MCP clients with `ctx.info()`, `ctx.error()`, etc.
 - **LLM Sampling:** Use `ctx.sample()` to request completions from the client's LLM.
-- **HTTP Request:** Use `ctx.http_request()` to make HTTP requests to other servers.
 - **Resource Access:** Use `ctx.read_resource()` to access resources on the server
 - **Progress Reporting:** Use `ctx.report_progress()` to report progress to the client.
 - and more...
@@ -288,9 +305,83 @@ async def main():
 
 Learn more in the [**Client Documentation**](https://gofastmcp.com/clients/client) and [**Transports Documentation**](https://gofastmcp.com/clients/transports).
 
+## Authentication
+
+### Enterprise Authentication, Zero Configuration
+
+FastMCP provides comprehensive authentication support that sets it apart from basic MCP implementations. Secure your servers and authenticate your clients with the same enterprise-grade providers used by major corporations.
+
+**Built-in OAuth Providers:**
+
+- **Google**
+- **GitHub**
+- **Microsoft Azure**
+- **Auth0**
+- **WorkOS**
+- **Descope**
+- **Discord**
+- **JWT/Custom**
+- **API Keys**
+
+Protecting a server takes just two lines:
+
+```python
+from fastmcp.server.auth.providers.google import GoogleProvider
+
+auth = GoogleProvider(client_id="...", client_secret="...", base_url="https://myserver.com")
+mcp = FastMCP("Protected Server", auth=auth)
+```
+
+Connecting to protected servers is even simpler:
+
+```python
+async with Client("https://protected-server.com/mcp", auth="oauth") as client:
+    # Automatic browser-based OAuth flow
+    result = await client.call_tool("protected_tool")
+```
+
+**Why FastMCP Auth Matters:**
+
+- **Production-Ready:** Persistent storage, token refresh, comprehensive error handling
+- **Zero-Config OAuth:** Just pass `auth="oauth"` for automatic setup
+- **Enterprise Integration:** WorkOS SSO, Azure Active Directory, Auth0 tenants
+- **Developer Experience:** Automatic browser launch, local callback server, environment variable support
+- **Advanced Architecture:** Full OIDC support, Dynamic Client Registration (DCR), and unique OAuth proxy pattern that enables DCR with any provider
+
+*Authentication this comprehensive is unique to FastMCP 2.0.*
+
+Learn more in the **Authentication Documentation** for [servers](https://gofastmcp.com/servers/auth) and [clients](https://gofastmcp.com/clients/auth).
+
+## Deployment
+
+### From Development to Production
+
+FastMCP supports every deployment scenario from local development to global scale:
+
+**Development:** Run locally with a single command
+
+```bash
+fastmcp run server.py
+```
+
+**Production:** Deploy to [**FastMCP Cloud**](https://fastmcp.cloud) — Remote MCP that just works
+
+- Instant HTTPS endpoints
+- Built-in authentication
+- Zero configuration
+- Free for personal servers
+
+**Self-Hosted:** Use HTTP or SSE transports for your own infrastructure
+
+```python
+mcp.run(transport="http", host="0.0.0.0", port=8000)
+```
+
+Learn more in the [**Deployment Documentation**](https://gofastmcp.com/deployment).
+
 ## Advanced Features
 
-FastMCP introduces powerful ways to structure and deploy your MCP applications.
+FastMCP introduces powerful ways to structure and compose your MCP applications.
 
 ### Proxy Servers
 
@@ -309,16 +400,6 @@ Learn more in the [**Composition Documentation**](https://gofastmcp.com/patterns
 Automatically generate FastMCP servers from existing OpenAPI specifications (`FastMCP.from_openapi()`) or FastAPI applications (`FastMCP.from_fastapi()`), instantly bringing your web APIs to the MCP ecosystem.
 
 Learn more: [**OpenAPI Integration**](https://gofastmcp.com/integrations/openapi) | [**FastAPI Integration**](https://gofastmcp.com/integrations/fastapi).
-
-### Authentication & Security
-
-FastMCP provides built-in authentication support to secure both your MCP servers and clients in production environments. Protect your server endpoints from unauthorized access and authenticate your clients against secured MCP servers using industry-standard protocols.
-
-- **Server Protection**: Secure your FastMCP server endpoints with configurable authentication providers
-- **Client Authentication**: Connect to authenticated MCP servers with automatic credential management
-- **Production Ready**: Support for common authentication patterns used in enterprise environments
-
-Learn more in the **Authentication Documentation** for [servers](https://gofastmcp.com/servers/auth) and [clients](https://gofastmcp.com/clients/auth).
 
 ## Running Your Server
 
@@ -406,20 +487,20 @@ uv run pytest --cov=src --cov=examples --cov-report=html
 
 ### Static Checks
 
-FastMCP uses `pre-commit` for code formatting, linting, and type-checking. All PRs must pass these checks (they run automatically in CI).
+FastMCP uses `prek` for code formatting, linting, and type-checking. All PRs must pass these checks (they run automatically in CI).
 
 Install the hooks locally:
 
 ```bash
-uv run pre-commit install
+uv run prek install
 ```
 
 The hooks will now run automatically on `git commit`. You can also run them manually at any time:
 
 ```bash
-pre-commit run --all-files
+prek run --all-files
 # or via uv
-uv run pre-commit run --all-files
+uv run prek run --all-files
 ```
 
 ### Pull Requests
@@ -427,7 +508,7 @@ uv run pre-commit run --all-files
 1. Fork the repository on GitHub.
 2. Create a feature branch from `main`.
 3. Make your changes, including tests and documentation updates.
-4. Ensure tests and pre-commit hooks pass.
+4. Ensure tests and prek hooks pass.
 5. Commit your changes and push to your fork.
 6. Open a pull request against the `main` branch of `jlowin/fastmcp`.
 

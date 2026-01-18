@@ -1,10 +1,12 @@
 """Provides a base mixin class and decorators for easy registration of class methods with FastMCP."""
 
+import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from mcp.types import ToolAnnotations
+from mcp.types import Annotations, ToolAnnotations
 
+import fastmcp
 from fastmcp.prompts.prompt import Prompt
 from fastmcp.resources.resource import Resource
 from fastmcp.tools.tool import Tool
@@ -28,10 +30,19 @@ def mcp_tool(
     tags: set[str] | None = None,
     annotations: ToolAnnotations | dict[str, Any] | None = None,
     exclude_args: list[str] | None = None,
-    serializer: Callable[[Any], str] | None = None,
+    serializer: Callable[[Any], str] | None = None,  # Deprecated
+    meta: dict[str, Any] | None = None,
     enabled: bool | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator to mark a method as an MCP tool for later registration."""
+    if serializer is not None and fastmcp.settings.deprecation_warnings:
+        warnings.warn(
+            "The `serializer` parameter is deprecated. "
+            "Return ToolResult from your tools for full control over serialization. "
+            "See https://gofastmcp.com/servers/tools#custom-serialization for migration examples.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         call_args = {
@@ -41,6 +52,7 @@ def mcp_tool(
             "annotations": annotations,
             "exclude_args": exclude_args,
             "serializer": serializer,
+            "meta": meta,
             "enabled": enabled,
         }
         call_args = {k: v for k, v in call_args.items() if v is not None}
@@ -54,9 +66,12 @@ def mcp_resource(
     uri: str,
     *,
     name: str | None = None,
+    title: str | None = None,
     description: str | None = None,
     mime_type: str | None = None,
     tags: set[str] | None = None,
+    annotations: Annotations | None = None,
+    meta: dict[str, Any] | None = None,
     enabled: bool | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator to mark a method as an MCP resource for later registration."""
@@ -65,9 +80,12 @@ def mcp_resource(
         call_args = {
             "uri": uri,
             "name": name or get_fn_name(func),
+            "title": title,
             "description": description,
             "mime_type": mime_type,
             "tags": tags,
+            "annotations": annotations,
+            "meta": meta,
             "enabled": enabled,
         }
         call_args = {k: v for k, v in call_args.items() if v is not None}
@@ -81,8 +99,10 @@ def mcp_resource(
 
 def mcp_prompt(
     name: str | None = None,
+    title: str | None = None,
     description: str | None = None,
     tags: set[str] | None = None,
+    meta: dict[str, Any] | None = None,
     enabled: bool | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator to mark a method as an MCP prompt for later registration."""
@@ -90,8 +110,10 @@ def mcp_prompt(
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         call_args = {
             "name": name or get_fn_name(func),
+            "title": title,
             "description": description,
             "tags": tags,
+            "meta": meta,
             "enabled": enabled,
         }
 
@@ -151,7 +173,6 @@ class MCPMixin:
             tool = Tool.from_function(
                 fn=method,
                 name=registration_info.get("name"),
-                title=registration_info.get("title"),
                 description=registration_info.get("description"),
                 tags=registration_info.get("tags"),
                 annotations=registration_info.get("annotations"),
@@ -159,7 +180,6 @@ class MCPMixin:
                 serializer=registration_info.get("serializer"),
                 output_schema=registration_info.get("output_schema"),
                 meta=registration_info.get("meta"),
-                enabled=registration_info.get("enabled"),
             )
 
             mcp_server.add_tool(tool)
@@ -195,10 +215,10 @@ class MCPMixin:
                 fn=method,
                 uri=registration_info["uri"],
                 name=registration_info.get("name"),
+                title=registration_info.get("title"),
                 description=registration_info.get("description"),
                 mime_type=registration_info.get("mime_type"),
                 tags=registration_info.get("tags"),
-                enabled=registration_info.get("enabled"),
                 annotations=registration_info.get("annotations"),
                 meta=registration_info.get("meta"),
             )
@@ -233,7 +253,6 @@ class MCPMixin:
                 title=registration_info.get("title"),
                 description=registration_info.get("description"),
                 tags=registration_info.get("tags"),
-                enabled=registration_info.get("enabled"),
                 meta=registration_info.get("meta"),
             )
             mcp_server.add_prompt(prompt)

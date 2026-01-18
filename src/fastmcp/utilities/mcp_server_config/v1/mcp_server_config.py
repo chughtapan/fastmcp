@@ -192,7 +192,7 @@ class MCPServerConfig(BaseModel):
         """
         if isinstance(v, dict):
             return FileSystemSource(**v)
-        return v
+        return v  # type: ignore[return-value]
 
     @field_validator("environment", mode="before")
     @classmethod
@@ -216,8 +216,8 @@ class MCPServerConfig(BaseModel):
 
         """
         if isinstance(v, dict):
-            return Deployment(**v)  # type: ignore[arg-type]
-        return cast(Deployment, v)
+            return Deployment(**v)
+        return cast(Deployment, v)  # type: ignore[return-value]
 
     @classmethod
     def from_file(cls, file_path: Path) -> MCPServerConfig:
@@ -291,9 +291,9 @@ class MCPServerConfig(BaseModel):
             environment = UVEnvironment(
                 python=python,
                 dependencies=dependencies,
-                requirements=requirements,
-                project=project,
-                editable=[editable] if editable else None,
+                requirements=Path(requirements) if requirements else None,
+                project=Path(project) if project else None,
+                editable=[Path(editable)] if editable else None,
             )
 
         # Build deployment config if any deployment args provided
@@ -301,9 +301,9 @@ class MCPServerConfig(BaseModel):
         if any([transport, host, port, path, log_level, env, cwd, args]):
             # Convert streamable-http to http for backward compatibility
             if transport == "streamable-http":
-                transport = "http"  # type: ignore[assignment]
+                transport = "http"
             deployment = Deployment(
-                transport=transport,  # type: ignore[arg-type]
+                transport=transport,
                 host=host,
                 port=port,
                 path=path,

@@ -164,7 +164,7 @@ def greet(name: str) -> str:
         server = await source.load_server()
         assert server.name == "TestServer"
         tools = await server.get_tools()
-        assert "greet" in tools
+        assert any(t.name == "greet" for t in tools)
 
     async def test_import_server_with_main_block(self, tmp_path):
         """Test importing server with if __name__ == '__main__' block."""
@@ -186,7 +186,7 @@ if __name__ == "__main__":
         server = await source.load_server()
         assert server.name == "MainServer"
         tools = await server.get_tools()
-        assert "calculate" in tools
+        assert any(t.name == "calculate" for t in tools)
 
     async def test_import_server_standard_names(self, tmp_path):
         """Test automatic detection of standard names (mcp, server, app)."""
@@ -240,7 +240,7 @@ def custom_tool() -> str:
         server = await source.load_server()
         assert server.name == "CustomServer"
         tools = await server.get_tools()
-        assert "custom_tool" in tools
+        assert any(t.name == "custom_tool" for t in tools)
 
     async def test_import_server_no_standard_names_fails(self, tmp_path):
         """Test importing server when no standard names exist fails."""
@@ -272,6 +272,210 @@ mcp = fastmcp.FastMCP("TestServer")
 
         assert isinstance(exc_info.value, SystemExit)
         assert exc_info.value.code == 1
+
+
+class TestV1ServerAsync:
+    """Test FastMCP 1.x server async support."""
+
+    async def test_run_v1_server_stdio(self, tmp_path):
+        """Test that v1 server uses async stdio method."""
+        from unittest.mock import AsyncMock, patch
+
+        from mcp.server.fastmcp import FastMCP as FastMCP1x
+
+        from fastmcp.cli.run import run_command
+
+        # Create a v1 FastMCP server file with both sync and async tools
+        test_file = tmp_path / "v1_server.py"
+        test_file.write_text("""
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("V1Server")
+
+@mcp.tool()
+def sync_echo(text: str) -> str:
+    '''Sync tool for testing'''
+    return f"sync: {text}"
+
+@mcp.tool()
+async def async_echo(text: str) -> str:
+    '''Async tool for testing'''
+    return f"async: {text}"
+""")
+
+        # Mock the async run method
+        with patch.object(
+            FastMCP1x, "run_stdio_async", new_callable=AsyncMock
+        ) as run_mock:
+            await run_command(str(test_file), transport="stdio")
+            run_mock.assert_called_once()
+
+    async def test_run_v1_server_http(self, tmp_path):
+        """Test that v1 server uses async http method."""
+        from unittest.mock import AsyncMock, patch
+
+        from mcp.server.fastmcp import FastMCP as FastMCP1x
+
+        from fastmcp.cli.run import run_command
+
+        # Create a v1 FastMCP server file with both sync and async tools
+        test_file = tmp_path / "v1_server.py"
+        test_file.write_text("""
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("V1Server")
+
+@mcp.tool()
+def sync_echo(text: str) -> str:
+    '''Sync tool for testing'''
+    return f"sync: {text}"
+
+@mcp.tool()
+async def async_echo(text: str) -> str:
+    '''Async tool for testing'''
+    return f"async: {text}"
+""")
+
+        # Mock the async run method
+        with patch.object(
+            FastMCP1x, "run_streamable_http_async", new_callable=AsyncMock
+        ) as run_mock:
+            await run_command(str(test_file), transport="http")
+            run_mock.assert_called_once()
+
+    async def test_run_v1_server_streamable_http(self, tmp_path):
+        """Test that v1 server uses async streamable-http method."""
+        from unittest.mock import AsyncMock, patch
+
+        from mcp.server.fastmcp import FastMCP as FastMCP1x
+
+        from fastmcp.cli.run import run_command
+
+        # Create a v1 FastMCP server file with both sync and async tools
+        test_file = tmp_path / "v1_server.py"
+        test_file.write_text("""
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("V1Server")
+
+@mcp.tool()
+def sync_echo(text: str) -> str:
+    '''Sync tool for testing'''
+    return f"sync: {text}"
+
+@mcp.tool()
+async def async_echo(text: str) -> str:
+    '''Async tool for testing'''
+    return f"async: {text}"
+""")
+
+        # Mock the async run method
+        with patch.object(
+            FastMCP1x, "run_streamable_http_async", new_callable=AsyncMock
+        ) as run_mock:
+            await run_command(str(test_file), transport="streamable-http")
+            run_mock.assert_called_once()
+
+    async def test_run_v1_server_sse(self, tmp_path):
+        """Test that v1 server uses async sse method."""
+        from unittest.mock import AsyncMock, patch
+
+        from mcp.server.fastmcp import FastMCP as FastMCP1x
+
+        from fastmcp.cli.run import run_command
+
+        # Create a v1 FastMCP server file with both sync and async tools
+        test_file = tmp_path / "v1_server.py"
+        test_file.write_text("""
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("V1Server")
+
+@mcp.tool()
+def sync_echo(text: str) -> str:
+    '''Sync tool for testing'''
+    return f"sync: {text}"
+
+@mcp.tool()
+async def async_echo(text: str) -> str:
+    '''Async tool for testing'''
+    return f"async: {text}"
+""")
+
+        # Mock the async run method
+        with patch.object(
+            FastMCP1x, "run_sse_async", new_callable=AsyncMock
+        ) as run_mock:
+            await run_command(str(test_file), transport="sse")
+            run_mock.assert_called_once()
+
+    async def test_run_v1_server_default_transport(self, tmp_path):
+        """Test that v1 server uses streamable-http by default."""
+        from unittest.mock import AsyncMock, patch
+
+        from mcp.server.fastmcp import FastMCP as FastMCP1x
+
+        from fastmcp.cli.run import run_command
+
+        # Create a v1 FastMCP server file with both sync and async tools
+        test_file = tmp_path / "v1_server.py"
+        test_file.write_text("""
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("V1Server")
+
+@mcp.tool()
+def sync_echo(text: str) -> str:
+    '''Sync tool for testing'''
+    return f"sync: {text}"
+
+@mcp.tool()
+async def async_echo(text: str) -> str:
+    '''Async tool for testing'''
+    return f"async: {text}"
+""")
+
+        # Mock the async run method
+        with patch.object(
+            FastMCP1x, "run_streamable_http_async", new_callable=AsyncMock
+        ) as run_mock:
+            await run_command(str(test_file))
+            run_mock.assert_called_once()
+
+    async def test_run_v1_server_with_host_port(self, tmp_path):
+        """Test that v1 server receives host/port settings."""
+        from unittest.mock import AsyncMock, patch
+
+        from mcp.server.fastmcp import FastMCP as FastMCP1x
+
+        from fastmcp.cli.run import run_command
+
+        # Create a v1 FastMCP server file with both sync and async tools
+        test_file = tmp_path / "v1_server.py"
+        test_file.write_text("""
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("V1Server")
+
+@mcp.tool()
+def sync_echo(text: str) -> str:
+    '''Sync tool for testing'''
+    return f"sync: {text}"
+
+@mcp.tool()
+async def async_echo(text: str) -> str:
+    '''Async tool for testing'''
+    return f"async: {text}"
+""")
+
+        # Mock the async run method
+        with patch.object(
+            FastMCP1x, "run_streamable_http_async", new_callable=AsyncMock
+        ) as run_mock:
+            await run_command(
+                str(test_file), transport="http", host="0.0.0.0", port=9000
+            )
+            run_mock.assert_called_once()
 
 
 class TestSkipSource:
@@ -396,3 +600,29 @@ mcp = fastmcp.FastMCP("TestServer")
 
             # Verify prepare was NOT called
             prepare_mock.assert_not_called()
+
+
+class TestReloadFunctionality:
+    """Test reload functionality."""
+
+    def test_python_file_filter_accepts_py_files(self):
+        """Test that Python file filter accepts .py files."""
+        from watchfiles import Change
+
+        from fastmcp.cli.run import _python_file_filter
+
+        assert _python_file_filter(Change.modified, "/path/to/file.py") is True
+        assert _python_file_filter(Change.added, "server.py") is True
+        assert _python_file_filter(Change.deleted, "/some/dir/module.py") is True
+
+    def test_python_file_filter_rejects_non_py_files(self):
+        """Test that Python file filter rejects non-.py files."""
+        from watchfiles import Change
+
+        from fastmcp.cli.run import _python_file_filter
+
+        assert _python_file_filter(Change.modified, "/path/to/file.txt") is False
+        assert _python_file_filter(Change.modified, "/path/to/file.js") is False
+        assert _python_file_filter(Change.modified, "/path/to/file.pyc") is False
+        assert _python_file_filter(Change.modified, "/path/to/.py") is True  # Edge case
+        assert _python_file_filter(Change.modified, "Dockerfile") is False

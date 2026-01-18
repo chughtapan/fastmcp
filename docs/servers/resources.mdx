@@ -39,15 +39,15 @@ def get_greeting() -> str:
     """Provides a simple greeting message."""
     return "Hello from FastMCP Resources!"
 
-# Resource returning JSON data (dict is auto-serialized)
+# Resource returning JSON data
 @mcp.resource("data://config")
-def get_config() -> dict:
+def get_config() -> str:
     """Provides application configuration as JSON."""
-    return {
+    return json.dumps({
         "theme": "dark",
         "version": "1.2.0",
         "features": ["tools", "resources"],
-    }
+    })
 ```
 
 **Key Concepts:**
@@ -76,9 +76,9 @@ mcp = FastMCP(name="DataServer")
     tags={"monitoring", "status"}, # Categorization tags
     meta={"version": "2.1", "team": "infrastructure"}  # Custom metadata
 )
-def get_application_status() -> dict:
+def get_application_status() -> str:
     """Internal function description (ignored if description is provided above)."""
-    return {"status": "ok", "uptime": 12345, "version": mcp.settings.version} # Example usage
+    return json.dumps({"status": "ok", "uptime": 12345, "version": mcp.settings.version})
 ```
 
 <Card icon="code" title="@resource Decorator Arguments">
@@ -103,7 +103,14 @@ def get_application_status() -> dict:
 </ParamField>
 
 <ParamField body="enabled" type="bool" default="True">
-  A boolean to enable or disable the resource. See [Disabling Resources](#disabling-resources) for more information
+  <Warning>Deprecated in v3.0.0. Use `mcp.enable()` / `mcp.disable()` at the server level instead.</Warning>
+  A boolean to enable or disable the resource. See [Visibility Control](#visibility-control) for the recommended approach.
+</ParamField>
+
+<ParamField body="icons" type="list[Icon] | None">
+  <VersionBadge version="2.13.0" />
+
+  Optional list of icon representations for this resource or template. See [Icons](/servers/icons) for detailed examples
 </ParamField>
 
 <ParamField body="annotations" type="Annotations | dict | None">
@@ -120,45 +127,120 @@ def get_application_status() -> dict:
 
 <ParamField body="meta" type="dict[str, Any] | None">
   <VersionBadge version="2.11.0" />
-  
-  Optional meta information about the resource. This data is passed through to the MCP client as the `_meta` field of the client-side resource object and can be used for custom metadata, versioning, or other application-specific purposes.
+
+  Optional meta information about the resource. This data is passed through to the MCP client as the `meta` field of the client-side resource object and can be used for custom metadata, versioning, or other application-specific purposes.
+</ParamField>
+
+<ParamField body="version" type="str | int | None">
+  <VersionBadge version="3.0.0" />
+
+  Optional version identifier for this resource. See [Versioning](/servers/versioning) for details.
 </ParamField>
 </Card>
 
+#### Using with Methods
+
+For decorating instance or class methods, use the standalone `@resource` decorator and register the bound method. See [Tools: Using with Methods](/servers/tools#using-with-methods) for the pattern.
+
 ### Return Values
 
-FastMCP automatically converts your function's return value into the appropriate MCP resource content:
+Resource functions must return one of three types:
 
 -   **`str`**: Sent as `TextResourceContents` (with `mime_type="text/plain"` by default).
--   **`dict`, `list`, `pydantic.BaseModel`**: Automatically serialized to a JSON string and sent as `TextResourceContents` (with `mime_type="application/json"` by default).
 -   **`bytes`**: Base64 encoded and sent as `BlobResourceContents`. You should specify an appropriate `mime_type` (e.g., `"image/png"`, `"application/octet-stream"`).
--   **`None`**: Results in an empty resource content list being returned.
+-   **`ResourceResult`**: Full control over contents, MIME types, and metadata. See [ResourceResult](#resourceresult) below.
 
-### Disabling Resources
+<Note>
+To return structured data like dicts or lists, serialize them to JSON strings using `json.dumps()`. This explicit approach ensures your type checker catches errors during development rather than at runtime when a client reads the resource.
+</Note>
 
-<VersionBadge version="2.8.0" />
+#### ResourceResult
 
-You can control the visibility and availability of resources and templates by enabling or disabling them. Disabled resources will not appear in the list of available resources or templates, and attempting to read a disabled resource will result in an "Unknown resource" error.
+<VersionBadge version="3.0.0" />
 
-By default, all resources are enabled. You can disable a resource upon creation using the `enabled` parameter in the decorator:
-
-```python
-@mcp.resource("data://secret", enabled=False)
-def get_secret_data():
-    """This resource is currently disabled."""
-    return "Secret data"
-```
-
-You can also toggle a resource's state programmatically after it has been created:
+`ResourceResult` gives you explicit control over resource responses: multiple content items, per-item MIME types, and metadata at both the item and result level.
 
 ```python
-@mcp.resource("data://config")
-def get_config(): return {"version": 1}
+from fastmcp import FastMCP
+from fastmcp.resources import ResourceResult, ResourceContent
 
-# Disable and re-enable the resource
-get_config.disable()
-get_config.enable()
+mcp = FastMCP()
+
+@mcp.resource("data://users")
+def get_users() -> ResourceResult:
+    return ResourceResult(
+        contents=[
+            ResourceContent(content='[{"id": 1}]', mime_type="application/json"),
+            ResourceContent(content="# Users\n...", mime_type="text/markdown"),
+        ],
+        meta={"total": 1}
+    )
 ```
+
+`ResourceContent` accepts three fields:
+
+**`content`** - The actual resource content. Can be `str` (text content) or `bytes` (binary content). This is the data that will be returned to the client.
+
+**`mime_type`** - Optional MIME type for the content. Defaults to `"text/plain"` for string content and `"application/octet-stream"` for binary content.
+
+**`meta`** - Optional metadata dictionary that will be included in the MCP response's `meta` field. Use this for runtime metadata like Content Security Policy headers, caching hints, or other client-specific data.
+
+For simple cases, you can pass `str` or `bytes` directly to `ResourceResult`:
+
+```python
+return ResourceResult("plain text")           # auto-converts to ResourceContent
+return ResourceResult(b"\x00\x01\x02")         # binary content
+```
+
+<Card title="ResourceResult">
+<ParamField body="contents" type="str | bytes | list[ResourceContent]" required>
+  Content to return. Strings and bytes are wrapped in a single `ResourceContent`. Use a list of `ResourceContent` for multiple items or custom MIME types.
+</ParamField>
+<ParamField body="meta" type="dict[str, Any] | None">
+  Result-level metadata, included in the MCP response's `_meta` field.
+</ParamField>
+</Card>
+
+<Card title="ResourceContent">
+<ParamField body="content" type="Any" required>
+  The content data. Strings and bytes pass through directly. Other types (dict, list, BaseModel) are automatically JSON-serialized.
+</ParamField>
+<ParamField body="mime_type" type="str | None">
+  MIME type. Defaults to `text/plain` for strings, `application/octet-stream` for bytes, `application/json` for serialized objects.
+</ParamField>
+<ParamField body="meta" type="dict[str, Any] | None">
+  Item-level metadata for this specific content.
+</ParamField>
+</Card>
+
+### Visibility Control
+
+<VersionBadge version="3.0.0" />
+
+You can control which resources are visible to clients using server-level visibility control. Disabled resources don't appear in `list_resources` and can't be read.
+
+```python
+from fastmcp import FastMCP
+
+mcp = FastMCP("MyServer")
+
+@mcp.resource("data://public", tags={"public"})
+def get_public(): return "public"
+
+@mcp.resource("data://secret", tags={"internal"})
+def get_secret(): return "secret"
+
+# Disable specific resources by key
+mcp.disable(keys=["resource:data://secret"])
+
+# Disable resources by tag
+mcp.disable(tags={"internal"})
+
+# Or use allowlist mode - only show resources with specific tags
+mcp.enable(tags={"public"}, only=True)
+```
+
+See [Local Provider](/servers/providers/local#visibility-control) for the complete visibility control API including key formats and tag-based filtering.
 
 
 ### Accessing MCP Context
@@ -173,20 +255,20 @@ from fastmcp import FastMCP, Context
 mcp = FastMCP(name="DataServer")
 
 @mcp.resource("resource://system-status")
-async def get_system_status(ctx: Context) -> dict:
+async def get_system_status(ctx: Context) -> str:
     """Provides system status information."""
-    return {
+    return json.dumps({
         "status": "operational",
         "request_id": ctx.request_id
-    }
+    })
 
 @mcp.resource("resource://{name}/details")
-async def get_details(name: str, ctx: Context) -> dict:
+async def get_details(name: str, ctx: Context) -> str:
     """Get details for a specific name."""
-    return {
+    return json.dumps({
         "name": name,
         "accessed_at": ctx.request_id
-    }
+    })
 ```
 
 For full documentation on the Context object and all its capabilities, see the [Context documentation](/servers/context).
@@ -194,7 +276,9 @@ For full documentation on the Context object and all its capabilities, see the [
 
 ### Async Resources
 
-Use `async def` for resource functions that perform I/O operations (e.g., reading from a database or network) to avoid blocking the server.
+FastMCP supports both `async def` and regular `def` resource functions. Synchronous functions automatically run in a threadpool to avoid blocking the event loop.
+
+For I/O-bound operations, async functions are more efficient:
 
 ```python
 import aiofiles
@@ -310,9 +394,9 @@ def example_resource() -> str:
     return "Hello!"
 
 # These operations trigger notifications:
-mcp.add_resource(example_resource)  # Sends resources/list_changed notification
-example_resource.disable()          # Sends resources/list_changed notification  
-example_resource.enable()           # Sends resources/list_changed notification
+mcp.add_resource(example_resource)                   # Sends resources/list_changed notification
+mcp.disable(keys=["resource:data://example"])        # Sends resources/list_changed notification
+mcp.enable(keys=["resource:data://example"])         # Sends resources/list_changed notification
 ```
 
 Notifications are only sent when these operations occur within an active MCP request context (e.g., when called from within a tool or other MCP operation). Operations performed during server initialization do not trigger notifications.
@@ -340,9 +424,9 @@ You can add annotations to a resource using the `annotations` parameter in the `
         "idempotentHint": True
     }
 )
-def get_config() -> dict:
+def get_config() -> str:
     """Get application configuration."""
-    return {"version": "1.0", "debug": False}
+    return json.dumps({"version": "1.0", "debug": False})
 ```
 
 FastMCP supports these standard annotations:
@@ -369,22 +453,21 @@ Functions with `*args` are not supported as resource templates. However, unlike 
 Here is a complete example that shows how to define two resource templates:
 
 ```python
+import json
 from fastmcp import FastMCP
 
 mcp = FastMCP(name="DataServer")
 
 # Template URI includes {city} placeholder
 @mcp.resource("weather://{city}/current")
-def get_weather(city: str) -> dict:
+def get_weather(city: str) -> str:
     """Provides weather information for a specific city."""
-    # In a real implementation, this would call a weather API
-    # Here we're using simplified logic for example purposes
-    return {
+    return json.dumps({
         "city": city.capitalize(),
         "temperature": 22,
         "condition": "Sunny",
         "unit": "celsius"
-    }
+    })
 
 # Template with multiple parameters and annotations
 @mcp.resource(
@@ -394,16 +477,15 @@ def get_weather(city: str) -> dict:
         "idempotentHint": True
     }
 )
-def get_repo_info(owner: str, repo: str) -> dict:
+def get_repo_info(owner: str, repo: str) -> str:
     """Retrieves information about a GitHub repository."""
-    # In a real implementation, this would call the GitHub API
-    return {
+    return json.dumps({
         "owner": owner,
         "name": repo,
         "full_name": f"{owner}/{repo}",
         "stars": 120,
         "forks": 48
-    }
+    })
 ```
 
 With these two templates defined, clients can request a variety of resources:
@@ -412,14 +494,14 @@ With these two templates defined, clients can request a variety of resources:
 - `repos://jlowin/fastmcp/info` → Returns info about the jlowin/fastmcp repository
 - `repos://prefecthq/prefect/info` → Returns info about the prefecthq/prefect repository
 
-### Wildcard Parameters
+### RFC 6570 URI Templates
+
+
+FastMCP implements [RFC 6570 URI Templates](https://datatracker.ietf.org/doc/html/rfc6570) for resource templates, providing a standardized way to define parameterized URIs. This includes support for simple expansion, wildcard path parameters, and form-style query parameters.
+
+#### Wildcard Parameters
 
 <VersionBadge version="2.2.4" />
-
-<Tip>
-Please note: FastMCP's support for wildcard parameters is an **extension** of the Model Context Protocol standard, which otherwise follows RFC 6570. Since all template processing happens in the FastMCP server, this should not cause any compatibility issues with other MCP implementations.
-</Tip>
-
 
 Resource templates support wildcard parameters that can match multiple path segments. While standard parameters (`{param}`) only match a single path segment and don't cross "/" boundaries, wildcard parameters (`{param*}`) can capture multiple segments including slashes. Wildcards capture all subsequent path segments *up until* the defined part of the URI template (whether literal or another parameter). This allows you to have multiple wildcard parameters in a single URI template.
 
@@ -448,7 +530,7 @@ def get_path_content(filepath: str) -> str:
 # Mixing standard and wildcard parameters
 @mcp.resource("repo://{owner}/{path*}/template.py")
 def get_template_file(owner: str, path: str) -> dict:
-    """Retrieves a file from a specific repository and path, but 
+    """Retrieves a file from a specific repository and path, but
     only if the resource ends with `template.py`"""
     # Can match repo://jlowin/fastmcp/src/resources/template.py
     return {
@@ -466,43 +548,88 @@ Wildcard parameters are useful when:
 
 Note that like regular parameters, each wildcard parameter must still be a named parameter in your function signature, and all required function parameters must appear in the URI template.
 
-### Default Values
+#### Query Parameters
 
-<VersionBadge version="2.2.0" />
+<VersionBadge version="2.13.0" />
 
-When creating resource templates, FastMCP enforces two rules for the relationship between URI template parameters and function parameters:
+FastMCP supports RFC 6570 form-style query parameters using the `{?param1,param2}` syntax. Query parameters provide a clean way to pass optional configuration to resources without cluttering the path.
 
-1. **Required Function Parameters:** All function parameters without default values (required parameters) must appear in the URI template.
-2. **URI Parameters:** All URI template parameters must exist as function parameters.
-
-However, function parameters with default values don't need to be included in the URI template. When a client requests a resource, FastMCP will:
-
-- Extract parameter values from the URI for parameters included in the template
-- Use default values for any function parameters not in the URI template
-
-This allows for flexible API designs. For example, a simple search template with optional parameters:
+Query parameters must be optional function parameters (have default values), while path parameters map to required function parameters. This enforces a clear separation: required data goes in the path, optional configuration in query params.
 
 ```python
 from fastmcp import FastMCP
 
 mcp = FastMCP(name="DataServer")
 
-@mcp.resource("search://{query}")
-def search_resources(query: str, max_results: int = 10, include_archived: bool = False) -> dict:
-    """Search for resources matching the query string."""
-    # Only 'query' is required in the URI, the other parameters use their defaults
-    results = perform_search(query, limit=max_results, archived=include_archived)
+# Basic query parameters
+@mcp.resource("data://{id}{?format}")
+def get_data(id: str, format: str = "json") -> str:
+    """Retrieve data in specified format."""
+    if format == "xml":
+        return f"<data id='{id}' />"
+    return f'{{"id": "{id}"}}'
+
+# Multiple query parameters with type coercion
+@mcp.resource("api://{endpoint}{?version,limit,offset}")
+def call_api(endpoint: str, version: int = 1, limit: int = 10, offset: int = 0) -> dict:
+    """Call API endpoint with pagination."""
     return {
-        "query": query,
-        "max_results": max_results,
-        "include_archived": include_archived,
-        "results": results
+        "endpoint": endpoint,
+        "version": version,
+        "limit": limit,
+        "offset": offset,
+        "results": fetch_results(endpoint, version, limit, offset)
     }
+
+# Query parameters with wildcards
+@mcp.resource("files://{path*}{?encoding,lines}")
+def read_file(path: str, encoding: str = "utf-8", lines: int = 100) -> str:
+    """Read file with optional encoding and line limit."""
+    return read_file_content(path, encoding, lines)
 ```
 
-With this template, clients can request `search://python` and the function will be called with `query="python", max_results=10, include_archived=False`. MCP Developers can still call the underlying `search_resources` function directly with more specific parameters.
+**Example requests:**
+- `data://123` → Uses default format `"json"`
+- `data://123?format=xml` → Uses format `"xml"`
+- `api://users?version=2&limit=50` → `version=2, limit=50, offset=0`
+- `files://src/main.py?encoding=ascii&lines=50` → Custom encoding and line limit
 
-You can also create multiple resource templates that provide different ways to access the same underlying data by manually applying decorators to a single function:
+FastMCP automatically coerces query parameter string values to the correct types based on your function's type hints (`int`, `float`, `bool`, `str`).
+
+**Query parameters vs. hidden defaults:**
+
+Query parameters expose optional configuration to clients. To hide optional parameters from clients entirely (always use defaults), simply omit them from the URI template:
+
+```python
+# Clients CAN override max_results via query string
+@mcp.resource("search://{query}{?max_results}")
+def search_configurable(query: str, max_results: int = 10) -> dict:
+    return {"query": query, "limit": max_results}
+
+# Clients CANNOT override max_results (not in URI template)
+@mcp.resource("search://{query}")
+def search_fixed(query: str, max_results: int = 10) -> dict:
+    return {"query": query, "limit": max_results}
+```
+
+### Template Parameter Rules
+
+<VersionBadge version="2.2.0" />
+
+FastMCP enforces these validation rules when creating resource templates:
+
+1. **Required function parameters** (no default values) must appear in the URI path template
+2. **Query parameters** (specified with `{?param}` syntax) must be optional function parameters with default values
+3. **All URI template parameters** (path and query) must exist as function parameters
+
+Optional function parameters (those with default values) can be:
+- Included as query parameters (`{?param}`) - clients can override via query string
+- Omitted from URI template - always uses default value, not exposed to clients
+- Used in alternative path templates - enables multiple ways to access the same resource
+
+**Multiple templates for one function:**
+
+Create multiple resource templates that expose the same function through different URI patterns by manually applying decorators:
 
 ```python
 from fastmcp import FastMCP
@@ -610,3 +737,9 @@ The duplicate behavior options are:
 -   `"error"`: Raises a `ValueError`, preventing the duplicate registration.
 -   `"replace"`: Silently replaces the existing resource/template with the new one.
 -   `"ignore"`: Keeps the original resource/template and ignores the new registration attempt.
+
+## Versioning
+
+<VersionBadge version="3.0.0" />
+
+Resources and resource templates support versioning, allowing you to maintain multiple implementations under the same URI while clients automatically receive the highest version. See [Versioning](/servers/versioning) for complete documentation on version comparison, retrieval, and migration patterns.

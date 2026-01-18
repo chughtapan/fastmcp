@@ -95,24 +95,29 @@ class _TransformingMCPServerMixin(FastMCPBaseModel):
         client_name: str | None = None,
     ) -> tuple[FastMCP[Any], ClientTransport]:
         """Turn the Transforming MCPServer into a FastMCP Server and also return the underlying transport."""
-        from fastmcp import FastMCP
         from fastmcp.client import Client
         from fastmcp.client.transports import (
             ClientTransport,  # pyright: ignore[reportUnusedImport]
         )
+        from fastmcp.server import create_proxy
 
-        transport: ClientTransport = super().to_transport()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue, reportUnknownVariableType]
+        transport: ClientTransport = super().to_transport()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue, reportUnknownVariableType]  # ty: ignore[unresolved-attribute]
         transport = cast(ClientTransport, transport)
 
         client: Client[ClientTransport] = Client(transport=transport, name=client_name)
 
-        wrapped_mcp_server = FastMCP.as_proxy(
+        wrapped_mcp_server = create_proxy(
+            client,
             name=server_name,
-            backend=client,
-            tool_transformations=self.tools,
             include_tags=self.include_tags,
             exclude_tags=self.exclude_tags,
         )
+
+        # Apply tool transforms if configured
+        if self.tools:
+            from fastmcp.server.transforms import ToolTransform
+
+            wrapped_mcp_server.add_transform(ToolTransform(self.tools))
 
         return wrapped_mcp_server, transport
 
@@ -143,6 +148,9 @@ class StdioMCPServer(BaseModel):
     # Execution context
     cwd: str | None = None  # Working directory for command execution
     timeout: int | None = None  # Maximum response time in milliseconds
+    keep_alive: bool | None = (
+        None  # Whether to keep the subprocess alive between connections
+    )
 
     # Metadata
     description: str | None = None  # Human-readable server description
@@ -161,6 +169,7 @@ class StdioMCPServer(BaseModel):
             args=self.args,
             env=self.env,
             cwd=self.cwd,
+            keep_alive=self.keep_alive,
         )
 
 
@@ -288,9 +297,8 @@ class MCPConfig(BaseModel):
     @classmethod
     def from_file(cls, file_path: Path) -> Self:
         """Load configuration from JSON file."""
-        if file_path.exists():
-            if content := file_path.read_text().strip():
-                return cls.model_validate_json(content)
+        if file_path.exists() and (content := file_path.read_text().strip()):
+            return cls.model_validate_json(content)
 
         raise ValueError(f"No MCP servers defined in the config: {file_path}")
 

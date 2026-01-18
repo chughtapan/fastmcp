@@ -2,92 +2,237 @@
 
 from __future__ import annotations
 
-import inspect
-import json
+import asyncio
 import re
 import secrets
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
+import weakref
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Mapping,
+    Sequence,
+)
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    suppress,
+)
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generic, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast, overload
 
 import anyio
 import httpx
 import mcp.types
 import uvicorn
-from mcp.server.lowlevel.helper_types import ReadResourceContents
+from key_value.aio.adapters.pydantic import PydanticAdapter
+from key_value.aio.protocols import AsyncKeyValue
+from key_value.aio.stores.memory import MemoryStore
 from mcp.server.lowlevel.server import LifespanResultT, NotificationOptions
 from mcp.server.stdio import stdio_server
+from mcp.shared.exceptions import McpError
 from mcp.types import (
     Annotations,
     AnyFunction,
     CallToolRequestParams,
     ContentBlock,
-    GetPromptResult,
     ToolAnnotations,
 )
-from mcp.types import Prompt as MCPPrompt
-from mcp.types import Resource as MCPResource
-from mcp.types import ResourceTemplate as MCPResourceTemplate
-from mcp.types import Tool as MCPTool
 from pydantic import AnyUrl
+from pydantic import ValidationError as PydanticValidationError
 from starlette.middleware import Middleware as ASGIMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import BaseRoute, Route
+from typing_extensions import Self
 
 import fastmcp
 import fastmcp.server
-from fastmcp.exceptions import DisabledError, NotFoundError
+from fastmcp.exceptions import (
+    AuthorizationError,
+    DisabledError,
+    FastMCPError,
+    NotFoundError,
+    PromptError,
+    ResourceError,
+    ToolError,
+    ValidationError,
+)
 from fastmcp.mcp_config import MCPConfig
-from fastmcp.prompts import Prompt, PromptManager
-from fastmcp.prompts.prompt import FunctionPrompt
-from fastmcp.resources import Resource, ResourceManager
+from fastmcp.prompts import Prompt
+from fastmcp.prompts.function_prompt import FunctionPrompt
+from fastmcp.prompts.prompt import PromptResult
+from fastmcp.resources.resource import Resource, ResourceResult
 from fastmcp.resources.template import ResourceTemplate
-from fastmcp.server.auth import AuthProvider
+from fastmcp.server.auth import AuthContext, AuthProvider, run_auth_checks
+from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.event_store import EventStore
 from fastmcp.server.http import (
     StarletteWithLifespan,
     create_sse_app,
     create_streamable_http_app,
 )
+from fastmcp.server.lifespan import Lifespan
 from fastmcp.server.low_level import LowLevelServer
 from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.server.providers import LocalProvider, Provider
+from fastmcp.server.tasks.config import TaskConfig, TaskMeta
+from fastmcp.server.telemetry import server_span
+from fastmcp.server.transforms import (
+    Namespace,
+    ToolTransform,
+    Transform,
+)
+from fastmcp.settings import DuplicateBehavior as DuplicateBehaviorSetting
 from fastmcp.settings import Settings
-from fastmcp.tools import ToolManager
-from fastmcp.tools.tool import FunctionTool, Tool, ToolResult
+from fastmcp.tools.function_tool import FunctionTool
+from fastmcp.tools.tool import AuthCheckCallable, Tool, ToolResult
 from fastmcp.tools.tool_transform import ToolTransformConfig
+from fastmcp.utilities.async_utils import gather
 from fastmcp.utilities.cli import log_server_banner
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.logging import get_logger, temporary_log_level
-from fastmcp.utilities.types import NotSet, NotSetT
+from fastmcp.utilities.pagination import paginate_sequence
+from fastmcp.utilities.types import FastMCPBaseModel, NotSet, NotSetT
+from fastmcp.utilities.versions import (
+    VersionSpec,
+    parse_version_key,
+    version_sort_key,
+)
 
 if TYPE_CHECKING:
+    from docket import Docket
+
     from fastmcp.client import Client
-    from fastmcp.client.sampling import ServerSamplingHandler
+    from fastmcp.client.client import FastMCP1Server
+    from fastmcp.client.sampling import SamplingHandler
     from fastmcp.client.transports import ClientTransport, ClientTransportT
-    from fastmcp.experimental.server.openapi import FastMCPOpenAPI as FastMCPOpenAPINew
-    from fastmcp.experimental.server.openapi.routing import (
-        ComponentFn as OpenAPIComponentFnNew,
-    )
-    from fastmcp.experimental.server.openapi.routing import RouteMap as RouteMapNew
-    from fastmcp.experimental.server.openapi.routing import (
-        RouteMapFn as OpenAPIRouteMapFnNew,
-    )
-    from fastmcp.server.openapi import ComponentFn as OpenAPIComponentFn
-    from fastmcp.server.openapi import FastMCPOpenAPI, RouteMap
-    from fastmcp.server.openapi import RouteMapFn as OpenAPIRouteMapFn
-    from fastmcp.server.proxy import FastMCPProxy
+    from fastmcp.server.providers.openapi import ComponentFn as OpenAPIComponentFn
+    from fastmcp.server.providers.openapi import RouteMap
+    from fastmcp.server.providers.openapi import RouteMapFn as OpenAPIRouteMapFn
+    from fastmcp.server.providers.proxy import FastMCPProxy
+    from fastmcp.tools.tool import ToolResultSerializerType
 
 logger = get_logger(__name__)
 
+
 DuplicateBehavior = Literal["warn", "error", "replace", "ignore"]
+
+
+def _resolve_on_duplicate(
+    on_duplicate: DuplicateBehavior | None,
+    on_duplicate_tools: DuplicateBehavior | None,
+    on_duplicate_resources: DuplicateBehavior | None,
+    on_duplicate_prompts: DuplicateBehavior | None,
+) -> DuplicateBehavior:
+    """Resolve on_duplicate from deprecated per-type params.
+
+    Takes the most strict value if multiple are provided.
+    Delete this function when removing deprecated params.
+    """
+    strictness_order: list[DuplicateBehavior] = ["error", "warn", "replace", "ignore"]
+    deprecated_values: list[DuplicateBehavior] = []
+
+    deprecated_params: list[tuple[str, DuplicateBehavior | None]] = [
+        ("on_duplicate_tools", on_duplicate_tools),
+        ("on_duplicate_resources", on_duplicate_resources),
+        ("on_duplicate_prompts", on_duplicate_prompts),
+    ]
+    for name, value in deprecated_params:
+        if value is not None:
+            if fastmcp.settings.deprecation_warnings:
+                warnings.warn(
+                    f"{name} is deprecated, use on_duplicate instead",
+                    DeprecationWarning,
+                    stacklevel=4,
+                )
+            deprecated_values.append(value)
+
+    if on_duplicate is None and deprecated_values:
+        return min(deprecated_values, key=lambda x: strictness_order.index(x))
+
+    return on_duplicate or "warn"
+
+
 Transport = Literal["stdio", "http", "sse", "streamable-http"]
 
 # Compiled URI parsing regex to split a URI into protocol and path components
 URI_PATTERN = re.compile(r"^([^:]+://)(.*?)$")
+
+
+LifespanCallable = Callable[
+    ["FastMCP[LifespanResultT]"], AbstractAsyncContextManager[LifespanResultT]
+]
+
+
+def _get_auth_context() -> tuple[bool, Any]:
+    """Get auth context for the current request.
+
+    Returns a tuple of (skip_auth, token) where:
+    - skip_auth=True means auth checks should be skipped (STDIO transport)
+    - token is the access token for HTTP transports (may be None if unauthenticated)
+
+    Uses late import to avoid circular import with context.py.
+    """
+    from fastmcp.server.context import _current_transport
+
+    is_stdio = _current_transport.get() == "stdio"
+    if is_stdio:
+        return (True, None)
+    return (False, get_access_token())
+
+
+C = TypeVar("C", bound="FastMCPComponent")
+
+
+def _dedupe_with_versions(
+    components: Sequence[C],
+    key_fn: Callable[[C], str],
+) -> list[C]:
+    """Deduplicate components by key, keeping highest version.
+
+    Groups components by key, selects the highest version from each group,
+    and injects available versions into meta if any component is versioned.
+
+    Args:
+        components: Sequence of components to deduplicate.
+        key_fn: Function to extract the grouping key from a component.
+
+    Returns:
+        Deduplicated list with versions injected into meta.
+    """
+    by_key: dict[str, list[C]] = {}
+    for c in components:
+        by_key.setdefault(key_fn(c), []).append(c)
+
+    result: list[C] = []
+    for versions in by_key.values():
+        highest: C = cast(C, max(versions, key=version_sort_key))
+        if any(c.version is not None for c in versions):
+            all_versions = sorted(
+                [c.version for c in versions if c.version is not None],
+                key=parse_version_key,
+                reverse=True,
+            )
+            meta = highest.meta or {}
+            highest = highest.model_copy(
+                update={
+                    "meta": {
+                        **meta,
+                        "fastmcp": {
+                            **meta.get("fastmcp", {}),
+                            "versions": all_versions,
+                        },
+                    }
+                }
+            )
+        result.append(highest)
+    return result
 
 
 @asynccontextmanager
@@ -98,63 +243,90 @@ async def default_lifespan(server: FastMCP[LifespanResultT]) -> AsyncIterator[An
         server: The server instance this lifespan is managing
 
     Returns:
-        An empty context object
+        An empty dictionary as the lifespan result.
     """
     yield {}
 
 
-def _lifespan_wrapper(
-    app: FastMCP[LifespanResultT],
-    lifespan: Callable[
-        [FastMCP[LifespanResultT]], AbstractAsyncContextManager[LifespanResultT]
-    ],
+def _lifespan_proxy(
+    fastmcp_server: FastMCP[LifespanResultT],
 ) -> Callable[
     [LowLevelServer[LifespanResultT]], AbstractAsyncContextManager[LifespanResultT]
 ]:
     @asynccontextmanager
     async def wrap(
-        s: LowLevelServer[LifespanResultT],
+        low_level_server: LowLevelServer[LifespanResultT],
     ) -> AsyncIterator[LifespanResultT]:
-        async with AsyncExitStack() as stack:
-            context = await stack.enter_async_context(lifespan(app))
-            yield context
+        if fastmcp_server._lifespan is default_lifespan:
+            yield {}
+            return
+
+        if not fastmcp_server._lifespan_result_set:
+            raise RuntimeError(
+                "FastMCP server has a lifespan defined but no lifespan result is set, which means the server's context manager was not entered. "
+                + " Are you running the server in a way that supports lifespans? If so, please file an issue at https://github.com/jlowin/fastmcp/issues."
+            )
+
+        yield fastmcp_server._lifespan_result
 
     return wrap
 
 
-class FastMCP(Generic[LifespanResultT]):
+PaginateT = TypeVar("PaginateT")
+
+
+def _apply_pagination(
+    items: Sequence[PaginateT],
+    cursor: str | None,
+    page_size: int | None,
+) -> tuple[list[PaginateT], str | None]:
+    """Apply pagination to items, raising McpError for invalid cursors.
+
+    If page_size is None, returns all items without pagination.
+    """
+    if page_size is None:
+        return list(items), None
+    try:
+        return paginate_sequence(items, cursor, page_size)
+    except ValueError as e:
+        raise McpError(mcp.types.ErrorData(code=-32602, message=str(e))) from e
+
+
+class StateValue(FastMCPBaseModel):
+    """Wrapper for stored context state values."""
+
+    value: Any
+
+
+class FastMCP(Provider, Generic[LifespanResultT]):
     def __init__(
         self,
         name: str | None = None,
         instructions: str | None = None,
         *,
         version: str | None = None,
-        auth: AuthProvider | None | NotSetT = NotSet,
-        middleware: list[Middleware] | None = None,
-        lifespan: (
-            Callable[
-                [FastMCP[LifespanResultT]],
-                AbstractAsyncContextManager[LifespanResultT],
-            ]
-            | None
-        ) = None,
-        dependencies: list[str] | None = None,
-        resource_prefix_format: Literal["protocol", "path"] | None = None,
+        website_url: str | None = None,
+        icons: list[mcp.types.Icon] | None = None,
+        auth: AuthProvider | None = None,
+        middleware: Sequence[Middleware] | None = None,
+        providers: Sequence[Provider] | None = None,
+        lifespan: LifespanCallable | Lifespan | None = None,
         mask_error_details: bool | None = None,
-        tools: list[Tool | Callable[..., Any]] | None = None,
-        tool_transformations: dict[str, ToolTransformConfig] | None = None,
-        tool_serializer: Callable[[Any], str] | None = None,
-        include_tags: set[str] | None = None,
-        exclude_tags: set[str] | None = None,
-        include_fastmcp_meta: bool | None = None,
+        tools: Sequence[Tool | Callable[..., Any]] | None = None,
+        tool_serializer: ToolResultSerializerType | None = None,
+        include_tags: Collection[str] | None = None,
+        exclude_tags: Collection[str] | None = None,
+        on_duplicate: DuplicateBehavior | None = None,
+        strict_input_validation: bool | None = None,
+        list_page_size: int | None = None,
+        tasks: bool | None = None,
+        session_state_store: AsyncKeyValue | None = None,
+        # ---
+        # --- DEPRECATED parameters ---
+        # ---
         on_duplicate_tools: DuplicateBehavior | None = None,
         on_duplicate_resources: DuplicateBehavior | None = None,
         on_duplicate_prompts: DuplicateBehavior | None = None,
-        # ---
-        # ---
-        # --- The following arguments are DEPRECATED ---
-        # ---
-        # ---
         log_level: str | None = None,
         debug: bool | None = None,
         host: str | None = None,
@@ -164,51 +336,94 @@ class FastMCP(Generic[LifespanResultT]):
         streamable_http_path: str | None = None,
         json_response: bool | None = None,
         stateless_http: bool | None = None,
-        sampling_handler: ServerSamplingHandler[LifespanResultT] | None = None,
+        sampling_handler: SamplingHandler | None = None,
         sampling_handler_behavior: Literal["always", "fallback"] | None = None,
+        tool_transformations: Mapping[str, ToolTransformConfig] | None = None,
     ):
-        self.resource_prefix_format: Literal["protocol", "path"] = (
-            resource_prefix_format or fastmcp.settings.resource_prefix_format
+        # Initialize Provider (sets up _transforms and _visibility)
+        super().__init__()
+
+        # Resolve on_duplicate from deprecated params (delete when removing deprecation)
+        self._on_duplicate: DuplicateBehaviorSetting = _resolve_on_duplicate(
+            on_duplicate,
+            on_duplicate_tools,
+            on_duplicate_resources,
+            on_duplicate_prompts,
         )
+
+        # Resolve server default for background task support
+        self._support_tasks_by_default: bool = tasks if tasks is not None else False
+
+        # Docket and Worker instances (set during lifespan for cross-task access)
+        self._docket = None
+        self._worker = None
 
         self._additional_http_routes: list[BaseRoute] = []
-        self._mounted_servers: list[MountedServer] = []
-        self._tool_manager = ToolManager(
-            duplicate_behavior=on_duplicate_tools,
-            mask_error_details=mask_error_details,
-            transformations=tool_transformations,
-        )
-        self._resource_manager = ResourceManager(
-            duplicate_behavior=on_duplicate_resources,
-            mask_error_details=mask_error_details,
-        )
-        self._prompt_manager = PromptManager(
-            duplicate_behavior=on_duplicate_prompts,
-            mask_error_details=mask_error_details,
-        )
-        self._tool_serializer = tool_serializer
 
-        if lifespan is None:
-            self._has_lifespan = False
-            lifespan = default_lifespan
+        # Session-scoped state store (shared across all requests)
+        self._state_storage: AsyncKeyValue = session_state_store or MemoryStore()
+        self._state_store: PydanticAdapter[StateValue] = PydanticAdapter[StateValue](
+            key_value=self._state_storage,
+            pydantic_model=StateValue,
+            default_collection="fastmcp_state",
+        )
+
+        # Create LocalProvider for local components
+        self._local_provider: LocalProvider = LocalProvider(
+            on_duplicate=self._on_duplicate
+        )
+
+        # Local provider is always first in the provider list
+        self._providers: list[Provider] = [
+            self._local_provider,
+            *(providers or []),
+        ]
+
+        # Store mask_error_details for execution error handling
+        self._mask_error_details: bool = (
+            mask_error_details
+            if mask_error_details is not None
+            else fastmcp.settings.mask_error_details
+        )
+
+        # Store list_page_size for pagination of list operations
+        if list_page_size is not None and list_page_size <= 0:
+            raise ValueError("list_page_size must be a positive integer")
+        self._list_page_size: int | None = list_page_size
+
+        if tool_serializer is not None and fastmcp.settings.deprecation_warnings:
+            warnings.warn(
+                "The `tool_serializer` parameter is deprecated. "
+                "Return ToolResult from your tools for full control over serialization. "
+                "See https://gofastmcp.com/servers/tools#custom-serialization for migration examples.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self._tool_serializer: Callable[[Any], str] | None = tool_serializer
+
+        # Handle Lifespan instances (they're callable) or regular lifespan functions
+        if lifespan is not None:
+            self._lifespan: LifespanCallable[LifespanResultT] = lifespan
         else:
-            self._has_lifespan = True
+            self._lifespan = cast(LifespanCallable[LifespanResultT], default_lifespan)
+        self._lifespan_result: LifespanResultT | None = None
+        self._lifespan_result_set: bool = False
+        self._started: asyncio.Event = asyncio.Event()
+
         # Generate random ID if no name provided
-        self._mcp_server = LowLevelServer[LifespanResultT](
+        self._mcp_server: LowLevelServer[LifespanResultT, Any] = LowLevelServer[
+            LifespanResultT
+        ](
+            fastmcp=self,
             name=name or self.generate_name(),
-            version=version,
+            version=version or fastmcp.__version__,
             instructions=instructions,
-            lifespan=_lifespan_wrapper(self, lifespan),
+            website_url=website_url,
+            icons=icons,
+            lifespan=_lifespan_proxy(fastmcp_server=self),
         )
 
-        # if auth is `NotSet`, try to create a provider from the environment
-        if auth is NotSet:
-            if fastmcp.settings.server_auth is not None:
-                # server_auth_class returns the class itself
-                auth = fastmcp.settings.server_auth_class()
-            else:
-                auth = None
-        self.auth = cast(AuthProvider | None, auth)
+        self.auth: AuthProvider | None = auth
 
         if tools:
             for tool in tools:
@@ -216,42 +431,51 @@ class FastMCP(Generic[LifespanResultT]):
                     tool = Tool.from_function(tool, serializer=self._tool_serializer)
                 self.add_tool(tool)
 
-        self.include_tags = include_tags
-        self.exclude_tags = exclude_tags
+        # Handle deprecated include_tags and exclude_tags parameters
+        if include_tags is not None:
+            warnings.warn(
+                "include_tags is deprecated. Use server.enable(tags=..., only=True) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            # For backwards compatibility, initialize allowlist from include_tags
+            self._visibility.enable(tags=set(include_tags), only=True)
+        if exclude_tags is not None:
+            warnings.warn(
+                "exclude_tags is deprecated. Use server.disable(tags=...) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            # For backwards compatibility, initialize blocklist from exclude_tags
+            self._visibility.disable(tags=set(exclude_tags))
 
-        self.middleware = middleware or []
+        # Handle deprecated tool_transformations parameter
+        if tool_transformations:
+            if fastmcp.settings.deprecation_warnings:
+                warnings.warn(
+                    "The tool_transformations parameter is deprecated. Use "
+                    "server.add_transform(ToolTransform({...})) instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            self._transforms.append(ToolTransform(dict(tool_transformations)))
+
+        self.strict_input_validation: bool = (
+            strict_input_validation
+            if strict_input_validation is not None
+            else fastmcp.settings.strict_input_validation
+        )
+
+        self.middleware: list[Middleware] = list(middleware or [])
 
         # Set up MCP protocol handlers
         self._setup_handlers()
 
-        # Handle dependencies with deprecation warning
-        # TODO: Remove dependencies parameter (deprecated in v2.11.4)
-        if dependencies is not None:
-            import warnings
-
-            warnings.warn(
-                "The 'dependencies' parameter is deprecated as of FastMCP 2.11.4 and will be removed in a future version. "
-                "Please specify dependencies in a fastmcp.json configuration file instead:\n"
-                '{\n  "entrypoint": "your_server.py",\n  "environment": {\n    "dependencies": '
-                f"{json.dumps(dependencies)}\n  }}\n}}\n"
-                "See https://gofastmcp.com/docs/deployment/server-configuration for more information.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        self.dependencies = (
-            dependencies or fastmcp.settings.server_dependencies
-        )  # TODO: Remove (deprecated in v2.11.4)
-
-        self.sampling_handler = sampling_handler
-        self.sampling_handler_behavior = sampling_handler_behavior or "fallback"
-
-        self.include_fastmcp_meta = (
-            include_fastmcp_meta
-            if include_fastmcp_meta is not None
-            else fastmcp.settings.include_fastmcp_meta
+        self.sampling_handler: SamplingHandler | None = sampling_handler
+        self.sampling_handler_behavior: Literal["always", "fallback"] = (
+            sampling_handler_behavior or "fallback"
         )
 
-        # handle deprecated settings
         self._handle_deprecated_settings(
             log_level=log_level,
             debug=debug,
@@ -333,17 +557,165 @@ class FastMCP(Generic[LifespanResultT]):
     def version(self) -> str | None:
         return self._mcp_server.version
 
+    @property
+    def website_url(self) -> str | None:
+        return self._mcp_server.website_url
+
+    @property
+    def icons(self) -> list[mcp.types.Icon]:
+        if self._mcp_server.icons is None:
+            return []
+        else:
+            return list(self._mcp_server.icons)
+
+    @property
+    def docket(self) -> Docket | None:
+        """Get the Docket instance if Docket support is enabled.
+
+        Returns None if Docket is not enabled or server hasn't been started yet.
+        """
+        return self._docket
+
+    @asynccontextmanager
+    async def _docket_lifespan(self) -> AsyncIterator[None]:
+        """Manage Docket instance and Worker for background task execution.
+
+        Docket infrastructure is only initialized if:
+        1. pydocket is installed (fastmcp[tasks] extra)
+        2. There are task-enabled components (task_config.mode != 'forbidden')
+
+        This means users with pydocket installed but no task-enabled components
+        won't spin up Docket/Worker infrastructure.
+        """
+        from fastmcp.server.dependencies import _current_server, is_docket_available
+
+        # Set FastMCP server in ContextVar so CurrentFastMCP can access it
+        # (use weakref to avoid reference cycles)
+        server_token = _current_server.set(weakref.ref(self))
+
+        try:
+            # If docket is not available, skip task infrastructure
+            if not is_docket_available():
+                yield
+                return
+
+            # Collect task-enabled components at startup with all transforms applied.
+            # Components must be available now to be registered with Docket workers;
+            # dynamically added components after startup won't be registered.
+            try:
+                task_components = list(await self.get_tasks())
+            except Exception as e:
+                logger.warning(f"Failed to get tasks: {e}")
+                if fastmcp.settings.mounted_components_raise_on_load_error:
+                    raise
+                task_components = []
+
+            # If no task-enabled components, skip Docket infrastructure entirely
+            if not task_components:
+                yield
+                return
+
+            # Docket is available AND there are task-enabled components
+            from docket import Docket, Worker
+
+            from fastmcp import settings
+            from fastmcp.server.dependencies import (
+                _current_docket,
+                _current_worker,
+            )
+
+            # Create Docket instance using configured name and URL
+            async with Docket(
+                name=settings.docket.name,
+                url=settings.docket.url,
+            ) as docket:
+                # Store on server instance for cross-task access (FastMCPTransport)
+                self._docket = docket
+
+                # Register task-enabled components with Docket
+                for component in task_components:
+                    component.register_with_docket(docket)
+
+                # Set Docket in ContextVar so CurrentDocket can access it
+                docket_token = _current_docket.set(docket)
+                try:
+                    # Build worker kwargs from settings
+                    worker_kwargs: dict[str, Any] = {
+                        "concurrency": settings.docket.concurrency,
+                        "redelivery_timeout": settings.docket.redelivery_timeout,
+                        "reconnection_delay": settings.docket.reconnection_delay,
+                    }
+                    if settings.docket.worker_name:
+                        worker_kwargs["name"] = settings.docket.worker_name
+
+                    # Create and start Worker
+                    async with Worker(docket, **worker_kwargs) as worker:
+                        # Store on server instance for cross-context access
+                        self._worker = worker
+                        # Set Worker in ContextVar so CurrentWorker can access it
+                        worker_token = _current_worker.set(worker)
+                        try:
+                            worker_task = asyncio.create_task(worker.run_forever())
+                            try:
+                                yield
+                            finally:
+                                worker_task.cancel()
+                                with suppress(asyncio.CancelledError):
+                                    await worker_task
+                        finally:
+                            _current_worker.reset(worker_token)
+                            self._worker = None
+                finally:
+                    # Reset ContextVar
+                    _current_docket.reset(docket_token)
+                    # Clear instance attribute
+                    self._docket = None
+        finally:
+            # Reset server ContextVar
+            _current_server.reset(server_token)
+
+    @asynccontextmanager
+    async def _lifespan_manager(self) -> AsyncIterator[None]:
+        if self._lifespan_result_set:
+            yield
+            return
+
+        async with (
+            self._lifespan(self) as user_lifespan_result,
+            self._docket_lifespan(),
+        ):
+            self._lifespan_result = user_lifespan_result
+            self._lifespan_result_set = True
+
+            async with AsyncExitStack[bool | None]() as stack:
+                # Start lifespans for all providers
+                for provider in self._providers:
+                    await stack.enter_async_context(provider.lifespan())
+
+                self._started.set()
+                try:
+                    yield
+                finally:
+                    self._started.clear()
+
+        self._lifespan_result_set = False
+        self._lifespan_result = None
+
     async def run_async(
         self,
         transport: Transport | None = None,
-        show_banner: bool = True,
+        show_banner: bool | None = None,
         **transport_kwargs: Any,
     ) -> None:
         """Run the FastMCP server asynchronously.
 
         Args:
             transport: Transport protocol to use ("stdio", "sse", or "streamable-http")
+            show_banner: Whether to display the server banner. If None, uses the
+                FASTMCP_SHOW_SERVER_BANNER setting (default: True).
         """
+        if show_banner is None:
+            show_banner = fastmcp.settings.show_server_banner
         if transport is None:
             transport = "stdio"
         if transport not in {"stdio", "http", "sse", "streamable-http"}:
@@ -366,13 +738,15 @@ class FastMCP(Generic[LifespanResultT]):
     def run(
         self,
         transport: Transport | None = None,
-        show_banner: bool = True,
+        show_banner: bool | None = None,
         **transport_kwargs: Any,
     ) -> None:
         """Run the FastMCP server. Note this is a synchronous function.
 
         Args:
-            transport: Transport protocol to use ("stdio", "sse", or "streamable-http")
+            transport: Transport protocol to use ("http", "stdio", "sse", or "streamable-http")
+            show_banner: Whether to display the server banner. If None, uses the
+                FASTMCP_SHOW_SERVER_BANNER setting (default: True).
         """
 
         anyio.run(
@@ -385,16 +759,110 @@ class FastMCP(Generic[LifespanResultT]):
         )
 
     def _setup_handlers(self) -> None:
-        """Set up core MCP protocol handlers."""
-        self._mcp_server.list_tools()(self._mcp_list_tools)
-        self._mcp_server.list_resources()(self._mcp_list_resources)
-        self._mcp_server.list_resource_templates()(self._mcp_list_resource_templates)
-        self._mcp_server.list_prompts()(self._mcp_list_prompts)
-        self._mcp_server.call_tool()(self._mcp_call_tool)
-        self._mcp_server.read_resource()(self._mcp_read_resource)
-        self._mcp_server.get_prompt()(self._mcp_get_prompt)
+        """Set up core MCP protocol handlers.
 
-    async def _apply_middleware(
+        List handlers use SDK decorators that pass the request object to our handler
+        (needed for pagination cursor). The SDK also populates caches like _tool_cache.
+
+        Exception: list_resource_templates SDK decorator doesn't pass the request,
+        so we register that handler directly.
+
+        The call_tool decorator is from the SDK (supports CreateTaskResult + validate_input).
+        The read_resource and get_prompt decorators are from LowLevelServer to add
+        CreateTaskResult support until the SDK provides it natively.
+        """
+        self._mcp_server.list_tools()(self._list_tools_mcp)
+        self._mcp_server.list_resources()(self._list_resources_mcp)
+        self._mcp_server.list_prompts()(self._list_prompts_mcp)
+
+        # list_resource_templates SDK decorator doesn't pass the request to handlers,
+        # so we register directly to get cursor access for pagination
+        self._mcp_server.request_handlers[mcp.types.ListResourceTemplatesRequest] = (
+            self._wrap_list_handler(self._list_resource_templates_mcp)
+        )
+
+        self._mcp_server.call_tool(validate_input=self.strict_input_validation)(
+            self._call_tool_mcp
+        )
+        self._mcp_server.read_resource()(self._read_resource_mcp)
+        self._mcp_server.get_prompt()(self._get_prompt_mcp)
+
+        # Register SEP-1686 task protocol handlers
+        self._setup_task_protocol_handlers()
+
+    def _wrap_list_handler(
+        self, handler: Callable[..., Awaitable[Any]]
+    ) -> Callable[..., Awaitable[mcp.types.ServerResult]]:
+        """Wrap a list handler to pass the request and return ServerResult."""
+
+        async def wrapper(request: Any) -> mcp.types.ServerResult:
+            result = await handler(request)
+            return mcp.types.ServerResult(result)
+
+        return wrapper
+
+    def _setup_task_protocol_handlers(self) -> None:
+        """Register SEP-1686 task protocol handlers with SDK.
+
+        Only registers handlers if docket is installed. Without docket,
+        task protocol requests will return "method not found" errors.
+        """
+        from fastmcp.server.dependencies import is_docket_available
+
+        if not is_docket_available():
+            return
+
+        from mcp.types import (
+            CancelTaskRequest,
+            GetTaskPayloadRequest,
+            GetTaskRequest,
+            ListTasksRequest,
+            ServerResult,
+        )
+
+        from fastmcp.server.tasks.requests import (
+            tasks_cancel_handler,
+            tasks_get_handler,
+            tasks_list_handler,
+            tasks_result_handler,
+        )
+
+        # Manually register handlers (SDK decorators fail with locally-defined functions)
+        # SDK expects handlers that receive Request objects and return ServerResult
+
+        async def handle_get_task(req: GetTaskRequest) -> ServerResult:
+            params = req.params.model_dump(by_alias=True, exclude_none=True)
+            result = await tasks_get_handler(self, params)
+            return ServerResult(result)
+
+        async def handle_get_task_result(req: GetTaskPayloadRequest) -> ServerResult:
+            params = req.params.model_dump(by_alias=True, exclude_none=True)
+            result = await tasks_result_handler(self, params)
+            return ServerResult(result)
+
+        async def handle_list_tasks(req: ListTasksRequest) -> ServerResult:
+            params = (
+                req.params.model_dump(by_alias=True, exclude_none=True)
+                if req.params
+                else {}
+            )
+            result = await tasks_list_handler(self, params)
+            return ServerResult(result)
+
+        async def handle_cancel_task(req: CancelTaskRequest) -> ServerResult:
+            params = req.params.model_dump(by_alias=True, exclude_none=True)
+            result = await tasks_cancel_handler(self, params)
+            return ServerResult(result)
+
+        # Register directly with SDK (same as what decorators do internally)
+        self._mcp_server.request_handlers[GetTaskRequest] = handle_get_task
+        self._mcp_server.request_handlers[GetTaskPayloadRequest] = (
+            handle_get_task_result
+        )
+        self._mcp_server.request_handlers[ListTasksRequest] = handle_list_tasks
+        self._mcp_server.request_handlers[CancelTaskRequest] = handle_cancel_task
+
+    async def _run_middleware(
         self,
         context: MiddlewareContext[Any],
         call_next: Callable[[MiddlewareContext[Any]], Awaitable[Any]],
@@ -408,48 +876,981 @@ class FastMCP(Generic[LifespanResultT]):
     def add_middleware(self, middleware: Middleware) -> None:
         self.middleware.append(middleware)
 
-    async def get_tools(self) -> dict[str, Tool]:
-        """Get all registered tools, indexed by registered key."""
-        return await self._tool_manager.get_tools()
+    def add_provider(self, provider: Provider) -> None:
+        """Add a provider for dynamic tools, resources, and prompts.
 
-    async def get_tool(self, key: str) -> Tool:
-        tools = await self.get_tools()
-        if key not in tools:
-            raise NotFoundError(f"Unknown tool: {key}")
-        return tools[key]
+        Providers are queried in registration order. The first provider to return
+        a non-None result wins. Static components (registered via decorators)
+        always take precedence over providers.
 
-    async def get_resources(self) -> dict[str, Resource]:
-        """Get all registered resources, indexed by registered key."""
-        return await self._resource_manager.get_resources()
-
-    async def get_resource(self, key: str) -> Resource:
-        resources = await self.get_resources()
-        if key not in resources:
-            raise NotFoundError(f"Unknown resource: {key}")
-        return resources[key]
-
-    async def get_resource_templates(self) -> dict[str, ResourceTemplate]:
-        """Get all registered resource templates, indexed by registered key."""
-        return await self._resource_manager.get_resource_templates()
-
-    async def get_resource_template(self, key: str) -> ResourceTemplate:
-        """Get a registered resource template by key."""
-        templates = await self.get_resource_templates()
-        if key not in templates:
-            raise NotFoundError(f"Unknown resource template: {key}")
-        return templates[key]
-
-    async def get_prompts(self) -> dict[str, Prompt]:
+        Args:
+            provider: A Provider instance that will provide components dynamically.
         """
-        List all available prompts.
-        """
-        return await self._prompt_manager.get_prompts()
+        self._providers.append(provider)
 
-    async def get_prompt(self, key: str) -> Prompt:
-        prompts = await self.get_prompts()
-        if key not in prompts:
-            raise NotFoundError(f"Unknown prompt: {key}")
-        return prompts[key]
+    # -------------------------------------------------------------------------
+    # Tool Transforms
+    # -------------------------------------------------------------------------
+
+    def _collect_list_results(
+        self, results: list[Sequence[Any] | BaseException], operation: str
+    ) -> list[Any]:
+        """Collect successful list results, logging any exceptions."""
+        collected: list[Any] = []
+        for i, result in enumerate(results):
+            if isinstance(result, BaseException):
+                logger.debug(
+                    f"Error during {operation} from provider "
+                    f"{self._providers[i]}: {result}"
+                )
+                continue
+            collected.extend(result)
+        return collected
+
+    # -------------------------------------------------------------------------
+    # Provider interface overrides (aggregate from sub-providers)
+    # -------------------------------------------------------------------------
+
+    async def _list_tools(self) -> Sequence[Tool]:
+        """Aggregate tools from all sub-providers.
+
+        This is the Provider interface implementation. The inherited list_tools()
+        applies server-level transforms over this method.
+        """
+        results = await gather(
+            *[p.list_tools() for p in self._providers],
+            return_exceptions=True,
+        )
+        return self._collect_list_results(results, "list_tools")
+
+    async def _list_resources(self) -> Sequence[Resource]:
+        """Aggregate resources from all sub-providers."""
+        results = await gather(
+            *[p.list_resources() for p in self._providers],
+            return_exceptions=True,
+        )
+        return self._collect_list_results(results, "list_resources")
+
+    async def _list_resource_templates(self) -> Sequence[ResourceTemplate]:
+        """Aggregate resource templates from all sub-providers."""
+        results = await gather(
+            *[p.list_resource_templates() for p in self._providers],
+            return_exceptions=True,
+        )
+        return self._collect_list_results(results, "list_resource_templates")
+
+    async def _list_prompts(self) -> Sequence[Prompt]:
+        """Aggregate prompts from all sub-providers."""
+        results = await gather(
+            *[p.list_prompts() for p in self._providers],
+            return_exceptions=True,
+        )
+        return self._collect_list_results(results, "list_prompts")
+
+    async def get_tasks(self) -> Sequence[FastMCPComponent]:
+        """Get task-eligible components with all transforms applied.
+
+        Overrides Provider.get_tasks() to collect task-eligible components
+        from all sub-providers and apply server-level transforms.
+        """
+        results = await gather(
+            *[p.get_tasks() for p in self._providers],
+            return_exceptions=True,
+        )
+        components = self._collect_list_results(results, "get_tasks")
+
+        # Separate by component type for transform application
+        tools = [c for c in components if isinstance(c, Tool)]
+        resources = [c for c in components if isinstance(c, Resource)]
+        templates = [c for c in components if isinstance(c, ResourceTemplate)]
+        prompts = [c for c in components if isinstance(c, Prompt)]
+
+        # Apply server-level transforms using call_next pattern
+        async def tools_base() -> Sequence[Tool]:
+            return tools
+
+        async def resources_base() -> Sequence[Resource]:
+            return resources
+
+        async def templates_base() -> Sequence[ResourceTemplate]:
+            return templates
+
+        async def prompts_base() -> Sequence[Prompt]:
+            return prompts
+
+        tools_chain = tools_base
+        resources_chain = resources_base
+        templates_chain = templates_base
+        prompts_chain = prompts_base
+
+        for transform in self.transforms:
+            tools_chain = partial(transform.list_tools, call_next=tools_chain)
+            resources_chain = partial(
+                transform.list_resources, call_next=resources_chain
+            )
+            templates_chain = partial(
+                transform.list_resource_templates, call_next=templates_chain
+            )
+            prompts_chain = partial(transform.list_prompts, call_next=prompts_chain)
+
+        transformed_tools = await tools_chain()
+        transformed_resources = await resources_chain()
+        transformed_templates = await templates_chain()
+        transformed_prompts = await prompts_chain()
+
+        return [
+            *transformed_tools,
+            *transformed_resources,
+            *transformed_templates,
+            *transformed_prompts,
+        ]
+
+    def add_transform(self, transform: Transform) -> None:
+        """Add a server-level transform.
+
+        Server-level transforms are applied after all providers are aggregated.
+        They transform tools, resources, and prompts from ALL providers.
+
+        Args:
+            transform: The transform to add.
+
+        Example:
+            ```python
+            from fastmcp.server.transforms import Namespace
+
+            server = FastMCP("Server")
+            server.add_transform(Namespace("api"))
+            # All tools from all providers become "api_toolname"
+            ```
+        """
+        self._transforms.append(transform)
+
+    def add_tool_transformation(
+        self, tool_name: str, transformation: ToolTransformConfig
+    ) -> None:
+        """Add a tool transformation.
+
+        .. deprecated::
+            Use ``add_transform(ToolTransform({...}))`` instead.
+        """
+        if fastmcp.settings.deprecation_warnings:
+            warnings.warn(
+                "add_tool_transformation is deprecated. Use "
+                "server.add_transform(ToolTransform({tool_name: config})) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.add_transform(ToolTransform({tool_name: transformation}))
+
+    def remove_tool_transformation(self, _tool_name: str) -> None:
+        """Remove a tool transformation.
+
+        .. deprecated::
+            Tool transformations are now immutable. Use visibility controls instead.
+        """
+        if fastmcp.settings.deprecation_warnings:
+            warnings.warn(
+                "remove_tool_transformation is deprecated and has no effect. "
+                "Transforms are immutable once added. Use server.disable(keys=[...]) "
+                "to hide tools instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+    # -------------------------------------------------------------------------
+    # Enable/Disable
+    # -------------------------------------------------------------------------
+
+    def enable(
+        self,
+        *,
+        keys: Sequence[str] | None = None,
+        tags: set[str] | None = None,
+        only: bool = False,
+    ) -> None:
+        """Enable components by removing from blocklist, or set allowlist with only=True.
+
+        Args:
+            keys: Keys to enable (e.g., ``"tool:my_tool@"`` for unversioned, ``"tool:my_tool@1.0"`` for versioned).
+            tags: Tags to enable - components with these tags will be enabled.
+            only: If True, switches to allowlist mode - ONLY show these keys/tags.
+                This clears existing allowlists and sets default visibility to False.
+
+        Note:
+            Component keys must match how they appear on this server. If a tool
+            passes through a transforming provider (e.g., mounted with a namespace),
+            its key changes. Always retrieve components from the same server you
+            call enable/disable on.
+
+        Example:
+            .. code-block:: python
+
+                # By key (prefixed)
+                server.enable(keys=["tool:my_tool@"])
+
+                # By tag
+                server.enable(tags={"internal"})
+
+                # Allowlist mode - ONLY show tools tagged "final"
+                server.enable(tags={"final"}, only=True)
+        """
+        self._visibility.enable(keys=keys, tags=tags, only=only)
+
+    def disable(
+        self,
+        *,
+        keys: Sequence[str] | None = None,
+        tags: set[str] | None = None,
+    ) -> None:
+        """Disable components by adding to the blocklist.
+
+        Args:
+            keys: Keys to disable (e.g., ``"tool:my_tool@"`` for unversioned, ``"tool:my_tool@1.0"`` for versioned).
+            tags: Tags to disable - components with these tags will be disabled.
+
+        Note:
+            Component keys must match how they appear on this server. If a tool
+            passes through a transforming provider (e.g., mounted with a namespace),
+            its key changes. Always retrieve components from the same server you
+            call enable/disable on.
+
+        Example:
+            .. code-block:: python
+
+                # By key (prefixed)
+                server.disable(keys=["tool:my_tool@"])
+
+                # By tag
+                server.disable(tags={"dangerous", "internal"})
+        """
+        self._visibility.disable(keys=keys, tags=tags)
+
+    async def get_tools(self, *, run_middleware: bool = False) -> list[Tool]:
+        """Get all enabled tools from providers.
+
+        Queries all providers via the root provider (which applies provider transforms,
+        server transforms, and visibility filtering). First provider wins for duplicate keys.
+
+        Args:
+            run_middleware: If True, apply the middleware chain before returning.
+                Used by MCP handlers and FastMCPProvider for nested servers.
+        """
+        async with fastmcp.server.context.Context(fastmcp=self) as ctx:
+            if run_middleware:
+                mw_context = MiddlewareContext(
+                    message=mcp.types.ListToolsRequest(method="tools/list"),
+                    source="client",
+                    type="request",
+                    method="tools/list",
+                    fastmcp_context=ctx,
+                )
+                return await self._run_middleware(
+                    context=mw_context,
+                    call_next=lambda context: self.get_tools(run_middleware=False),
+                )
+
+            # Query through full transform chain (provider transforms + server transforms + visibility)
+            tools = await self.list_tools()
+
+            # Get auth context (skip_auth=True for STDIO which has no auth concept)
+            skip_auth, token = _get_auth_context()
+
+            # Filter by auth
+            authorized: list[Tool] = []
+            for tool in tools:
+                if not skip_auth and tool.auth is not None:
+                    ctx = AuthContext(token=token, component=tool)
+                    try:
+                        if not run_auth_checks(tool.auth, ctx):
+                            continue
+                    except AuthorizationError:
+                        continue
+                authorized.append(tool)
+
+            return _dedupe_with_versions(authorized, lambda t: t.name)
+
+    async def _get_tool(
+        self, name: str, version: VersionSpec | None = None
+    ) -> Tool | None:
+        """Get a tool by name via aggregation from providers.
+
+        This is the raw lookup that Provider.get_tool() wraps with transforms.
+        Aggregates from all sub-providers and applies component-level auth.
+
+        Args:
+            name: The tool name.
+            version: Version filter (None returns highest version).
+
+        Returns:
+            The tool if found and authorized, None if not found or unauthorized.
+        """
+
+        # Aggregate from all sub-providers (each applies their own transforms)
+        results = await gather(
+            *[p.get_tool(name, version) for p in self._providers],
+            return_exceptions=True,
+        )
+
+        # Collect valid results, pick highest version
+        valid: list[Tool] = []
+        for i, result in enumerate(results):
+            if isinstance(result, BaseException):
+                if not isinstance(result, NotFoundError):
+                    logger.debug(
+                        f"Error during get_tool({name!r}) from provider "
+                        f"{self._providers[i]}: {result}"
+                    )
+                continue
+            if result is not None:
+                valid.append(result)
+
+        if not valid:
+            return None
+
+        tool: Tool = max(valid, key=version_sort_key)  # type: ignore[type-var]
+
+        # Component auth - return None if unauthorized (consistent with list filtering)
+        skip_auth, token = _get_auth_context()
+        if not skip_auth and tool.auth is not None:
+            ctx = AuthContext(token=token, component=tool)
+            try:
+                if not run_auth_checks(tool.auth, ctx):
+                    return None
+            except AuthorizationError:
+                return None
+
+        return tool
+
+    # get_tool() is inherited from Provider - wraps _get_tool() with transforms
+
+    async def get_resources(self, *, run_middleware: bool = False) -> list[Resource]:
+        """Get all enabled resources from providers.
+
+        Queries all providers via the root provider (which applies provider transforms,
+        server transforms, and visibility filtering). First provider wins for duplicate keys.
+
+        Args:
+            run_middleware: If True, apply the middleware chain before returning.
+                Used by MCP handlers and FastMCPProvider for nested servers.
+        """
+        async with fastmcp.server.context.Context(fastmcp=self) as ctx:
+            if run_middleware:
+                mw_context = MiddlewareContext(
+                    message={},
+                    source="client",
+                    type="request",
+                    method="resources/list",
+                    fastmcp_context=ctx,
+                )
+                return await self._run_middleware(
+                    context=mw_context,
+                    call_next=lambda context: self.get_resources(run_middleware=False),
+                )
+
+            # Query through full transform chain (provider transforms + server transforms + visibility)
+            resources = await self.list_resources()
+
+            # Get auth context (skip_auth=True for STDIO which has no auth concept)
+            skip_auth, token = _get_auth_context()
+
+            # Filter by auth
+            authorized: list[Resource] = []
+            for resource in resources:
+                if not skip_auth and resource.auth is not None:
+                    ctx = AuthContext(token=token, component=resource)
+                    try:
+                        if not run_auth_checks(resource.auth, ctx):
+                            continue
+                    except AuthorizationError:
+                        continue
+                authorized.append(resource)
+
+            return _dedupe_with_versions(authorized, lambda r: str(r.uri))
+
+    async def _get_resource(
+        self, uri: str, version: VersionSpec | None = None
+    ) -> Resource | None:
+        """Get a resource by URI via aggregation from providers.
+
+        This is the raw lookup that Provider.get_resource() wraps with transforms.
+        Aggregates from all sub-providers and applies component-level auth.
+
+        Args:
+            uri: The resource URI.
+            version: Version filter (None returns highest version).
+
+        Returns:
+            The resource if found and authorized, None if not found or unauthorized.
+        """
+        # Aggregate from all sub-providers (each applies their own transforms)
+        results = await gather(
+            *[p.get_resource(uri, version) for p in self._providers],
+            return_exceptions=True,
+        )
+
+        # Collect valid results, pick highest version
+        valid: list[Resource] = []
+        for i, result in enumerate(results):
+            if isinstance(result, BaseException):
+                if not isinstance(result, NotFoundError):
+                    logger.debug(
+                        f"Error during get_resource({uri!r}) from provider "
+                        f"{self._providers[i]}: {result}"
+                    )
+                continue
+            if result is not None:
+                valid.append(result)
+
+        if not valid:
+            return None
+
+        resource: Resource = max(valid, key=version_sort_key)  # type: ignore[type-var]
+
+        # Component auth - return None if unauthorized (consistent with list filtering)
+        skip_auth, token = _get_auth_context()
+        if not skip_auth and resource.auth is not None:
+            ctx = AuthContext(token=token, component=resource)
+            try:
+                if not run_auth_checks(resource.auth, ctx):
+                    return None
+            except AuthorizationError:
+                return None
+
+        return resource
+
+    # get_resource() is inherited from Provider - wraps _get_resource() with transforms
+
+    async def get_resource_templates(
+        self, *, run_middleware: bool = False
+    ) -> list[ResourceTemplate]:
+        """Get all enabled resource templates from providers.
+
+        Queries all providers via the root provider (which applies provider transforms,
+        server transforms, and visibility filtering). First provider wins for duplicate keys.
+
+        Args:
+            run_middleware: If True, apply the middleware chain before returning.
+                Used by MCP handlers and FastMCPProvider for nested servers.
+        """
+        async with fastmcp.server.context.Context(fastmcp=self) as ctx:
+            if run_middleware:
+                mw_context = MiddlewareContext(
+                    message={},
+                    source="client",
+                    type="request",
+                    method="resources/templates/list",
+                    fastmcp_context=ctx,
+                )
+                return await self._run_middleware(
+                    context=mw_context,
+                    call_next=lambda context: self.get_resource_templates(
+                        run_middleware=False
+                    ),
+                )
+
+            # Query through full transform chain (provider transforms + server transforms + visibility)
+            templates = await self.list_resource_templates()
+
+            # Get auth context (skip_auth=True for STDIO which has no auth concept)
+            skip_auth, token = _get_auth_context()
+
+            # Filter by auth
+            authorized: list[ResourceTemplate] = []
+            for template in templates:
+                if not skip_auth and template.auth is not None:
+                    ctx = AuthContext(token=token, component=template)
+                    try:
+                        if not run_auth_checks(template.auth, ctx):
+                            continue
+                    except AuthorizationError:
+                        continue
+                authorized.append(template)
+
+            return _dedupe_with_versions(authorized, lambda t: t.uri_template)
+
+    async def _get_resource_template(
+        self, uri: str, version: VersionSpec | None = None
+    ) -> ResourceTemplate | None:
+        """Get a resource template by URI via aggregation from providers.
+
+        This is the raw lookup that Provider.get_resource_template() wraps with transforms.
+        Aggregates from all sub-providers and applies component-level auth.
+
+        Args:
+            uri: The template URI to match.
+            version: Version filter (None returns highest version).
+
+        Returns:
+            The template if found and authorized, None if not found or unauthorized.
+        """
+        # Aggregate from all sub-providers (each applies their own transforms)
+        results = await gather(
+            *[p.get_resource_template(uri, version) for p in self._providers],
+            return_exceptions=True,
+        )
+
+        # Collect valid results, pick highest version
+        valid: list[ResourceTemplate] = []
+        for i, result in enumerate(results):
+            if isinstance(result, BaseException):
+                if not isinstance(result, NotFoundError):
+                    logger.debug(
+                        f"Error during get_resource_template({uri!r}) from provider "
+                        f"{self._providers[i]}: {result}"
+                    )
+                continue
+            if result is not None:
+                valid.append(result)
+
+        if not valid:
+            return None
+
+        template: ResourceTemplate = max(valid, key=version_sort_key)  # type: ignore[type-var]
+
+        # Component auth - return None if unauthorized (consistent with list filtering)
+        skip_auth, token = _get_auth_context()
+        if not skip_auth and template.auth is not None:
+            ctx = AuthContext(token=token, component=template)
+            try:
+                if not run_auth_checks(template.auth, ctx):
+                    return None
+            except AuthorizationError:
+                return None
+
+        return template
+
+    # get_resource_template() is inherited from Provider - wraps _get_resource_template() with transforms
+
+    async def get_prompts(self, *, run_middleware: bool = False) -> list[Prompt]:
+        """Get all enabled prompts from providers.
+
+        Queries all providers via the root provider (which applies provider transforms,
+        server transforms, and visibility filtering). First provider wins for duplicate keys.
+
+        Args:
+            run_middleware: If True, apply the middleware chain before returning.
+                Used by MCP handlers and FastMCPProvider for nested servers.
+        """
+        async with fastmcp.server.context.Context(fastmcp=self) as ctx:
+            if run_middleware:
+                mw_context = MiddlewareContext(
+                    message={},
+                    source="client",
+                    type="request",
+                    method="prompts/list",
+                    fastmcp_context=ctx,
+                )
+                return await self._run_middleware(
+                    context=mw_context,
+                    call_next=lambda context: self.get_prompts(run_middleware=False),
+                )
+
+            # Query through full transform chain (provider transforms + server transforms + visibility)
+            prompts = await self.list_prompts()
+
+            # Get auth context (skip_auth=True for STDIO which has no auth concept)
+            skip_auth, token = _get_auth_context()
+
+            # Filter by auth
+            authorized: list[Prompt] = []
+            for prompt in prompts:
+                if not skip_auth and prompt.auth is not None:
+                    ctx = AuthContext(token=token, component=prompt)
+                    try:
+                        if not run_auth_checks(prompt.auth, ctx):
+                            continue
+                    except AuthorizationError:
+                        continue
+                authorized.append(prompt)
+
+            return _dedupe_with_versions(authorized, lambda p: p.name)
+
+    async def _get_prompt(
+        self, name: str, version: VersionSpec | None = None
+    ) -> Prompt | None:
+        """Get a prompt by name via aggregation from providers.
+
+        This is the raw lookup that Provider.get_prompt() wraps with transforms.
+        Aggregates from all sub-providers and applies component-level auth.
+
+        Args:
+            name: The prompt name.
+            version: Version filter (None returns highest version).
+
+        Returns:
+            The prompt if found and authorized, None if not found or unauthorized.
+        """
+        # Aggregate from all sub-providers (each applies their own transforms)
+        results = await gather(
+            *[p.get_prompt(name, version) for p in self._providers],
+            return_exceptions=True,
+        )
+
+        # Collect valid results, pick highest version
+        valid: list[Prompt] = []
+        for i, result in enumerate(results):
+            if isinstance(result, BaseException):
+                if not isinstance(result, NotFoundError):
+                    logger.debug(
+                        f"Error during get_prompt({name!r}) from provider "
+                        f"{self._providers[i]}: {result}"
+                    )
+                continue
+            if result is not None:
+                valid.append(result)
+
+        if not valid:
+            return None
+
+        prompt: Prompt = max(valid, key=version_sort_key)  # type: ignore[type-var]
+
+        # Component auth - return None if unauthorized (consistent with list filtering)
+        skip_auth, token = _get_auth_context()
+        if not skip_auth and prompt.auth is not None:
+            ctx = AuthContext(token=token, component=prompt)
+            try:
+                if not run_auth_checks(prompt.auth, ctx):
+                    return None
+            except AuthorizationError:
+                return None
+
+        return prompt
+
+    # get_prompt() is inherited from Provider - wraps _get_prompt() with transforms
+
+    @overload
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        version: VersionSpec | None = None,
+        run_middleware: bool = True,
+        task_meta: None = None,
+    ) -> ToolResult: ...
+
+    @overload
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        version: VersionSpec | None = None,
+        run_middleware: bool = True,
+        task_meta: TaskMeta,
+    ) -> mcp.types.CreateTaskResult: ...
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        version: VersionSpec | None = None,
+        run_middleware: bool = True,
+        task_meta: TaskMeta | None = None,
+    ) -> ToolResult | mcp.types.CreateTaskResult:
+        """Call a tool by name.
+
+        This is the public API for executing tools. By default, middleware is applied.
+
+        Args:
+            name: The tool name
+            arguments: Tool arguments (optional)
+            version: Specific version to call. If None, calls highest version.
+            run_middleware: If True (default), apply the middleware chain.
+                Set to False when called from middleware to avoid re-applying.
+            task_meta: If provided, execute as a background task and return
+                CreateTaskResult. If None (default), execute synchronously and
+                return ToolResult.
+
+        Returns:
+            ToolResult when task_meta is None.
+            CreateTaskResult when task_meta is provided.
+
+        Raises:
+            NotFoundError: If tool not found or disabled
+            ToolError: If tool execution fails
+            ValidationError: If arguments fail validation
+        """
+        # Note: fn_key enrichment happens here after finding the tool.
+        # For mounted servers, the parent's provider sets fn_key to the
+        # namespaced key before delegating, ensuring correct Docket routing.
+
+        async with fastmcp.server.context.Context(fastmcp=self) as ctx:
+            if run_middleware:
+                mw_context = MiddlewareContext[CallToolRequestParams](
+                    message=mcp.types.CallToolRequestParams(
+                        name=name, arguments=arguments or {}
+                    ),
+                    source="client",
+                    type="request",
+                    method="tools/call",
+                    fastmcp_context=ctx,
+                )
+                return await self._run_middleware(
+                    context=mw_context,
+                    call_next=lambda context: self.call_tool(
+                        context.message.name,
+                        context.message.arguments or {},
+                        version=version,
+                        run_middleware=False,
+                        task_meta=task_meta,
+                    ),
+                )
+
+            # Core logic: find and execute tool (providers queried in parallel)
+            # Use _get_tool to apply transforms (including visibility)
+            with server_span(
+                f"tools/call {name}", "tools/call", self.name, "tool", name
+            ) as span:
+                tool = await self.get_tool(name, version=version)
+                if tool is None:
+                    raise NotFoundError(f"Unknown tool: {name!r}")
+                span.set_attributes(tool.get_span_attributes())
+                if task_meta is not None and task_meta.fn_key is None:
+                    task_meta = replace(task_meta, fn_key=tool.key)
+                try:
+                    return await tool._run(arguments or {}, task_meta=task_meta)
+                except FastMCPError:
+                    logger.exception(f"Error calling tool {name!r}")
+                    raise
+                except (ValidationError, PydanticValidationError):
+                    logger.exception(f"Error validating tool {name!r}")
+                    raise
+                except Exception as e:
+                    logger.exception(f"Error calling tool {name!r}")
+                    if self._mask_error_details:
+                        raise ToolError(f"Error calling tool {name!r}") from e
+                    raise ToolError(f"Error calling tool {name!r}: {e}") from e
+
+    @overload
+    async def read_resource(
+        self,
+        uri: str,
+        *,
+        version: VersionSpec | None = None,
+        run_middleware: bool = True,
+        task_meta: None = None,
+    ) -> ResourceResult: ...
+
+    @overload
+    async def read_resource(
+        self,
+        uri: str,
+        *,
+        version: VersionSpec | None = None,
+        run_middleware: bool = True,
+        task_meta: TaskMeta,
+    ) -> mcp.types.CreateTaskResult: ...
+
+    async def read_resource(
+        self,
+        uri: str,
+        *,
+        version: VersionSpec | None = None,
+        run_middleware: bool = True,
+        task_meta: TaskMeta | None = None,
+    ) -> ResourceResult | mcp.types.CreateTaskResult:
+        """Read a resource by URI.
+
+        This is the public API for reading resources. By default, middleware is applied.
+        Checks concrete resources first, then templates.
+
+        Args:
+            uri: The resource URI
+            version: Specific version to read. If None, reads highest version.
+            run_middleware: If True (default), apply the middleware chain.
+                Set to False when called from middleware to avoid re-applying.
+            task_meta: If provided, execute as a background task and return
+                CreateTaskResult. If None (default), execute synchronously and
+                return ResourceResult.
+
+        Returns:
+            ResourceResult when task_meta is None.
+            CreateTaskResult when task_meta is provided.
+
+        Raises:
+            NotFoundError: If resource not found or disabled
+            ResourceError: If resource read fails
+        """
+        # Note: fn_key enrichment happens here after finding the resource/template.
+        # Resources and templates use different key formats:
+        # - Resources use resource.key (derived from the concrete URI)
+        # - Templates use template.key (the template pattern)
+        # For mounted servers, the parent's provider sets fn_key to the
+        # namespaced key before delegating, ensuring correct Docket routing.
+
+        async with fastmcp.server.context.Context(fastmcp=self) as ctx:
+            if run_middleware:
+                uri_param = AnyUrl(uri)
+                mw_context = MiddlewareContext(
+                    message=mcp.types.ReadResourceRequestParams(uri=uri_param),
+                    source="client",
+                    type="request",
+                    method="resources/read",
+                    fastmcp_context=ctx,
+                )
+                return await self._run_middleware(
+                    context=mw_context,
+                    call_next=lambda context: self.read_resource(
+                        str(context.message.uri),
+                        version=version,
+                        run_middleware=False,
+                        task_meta=task_meta,
+                    ),
+                )
+
+            # Core logic: find and read resource (providers queried in parallel)
+            with server_span(
+                f"resources/read {uri}",
+                "resources/read",
+                self.name,
+                "resource",
+                uri,
+                resource_uri=uri,
+            ) as span:
+                # Try concrete resources first (transforms + auth via _get_resource)
+                resource = await self.get_resource(uri, version=version)
+                if resource is not None:
+                    span.set_attributes(resource.get_span_attributes())
+                    if task_meta is not None and task_meta.fn_key is None:
+                        task_meta = replace(task_meta, fn_key=resource.key)
+                    try:
+                        return await resource._read(task_meta=task_meta)
+                    except (FastMCPError, McpError):
+                        logger.exception(f"Error reading resource {uri!r}")
+                        raise
+                    except Exception as e:
+                        logger.exception(f"Error reading resource {uri!r}")
+                        if self._mask_error_details:
+                            raise ResourceError(
+                                f"Error reading resource {uri!r}"
+                            ) from e
+                        raise ResourceError(
+                            f"Error reading resource {uri!r}: {e}"
+                        ) from e
+
+                # Try templates (transforms + auth via get_resource_template)
+                template = await self.get_resource_template(uri, version=version)
+                if template is None:
+                    if version is None:
+                        raise NotFoundError(f"Unknown resource: {uri!r}")
+                    raise NotFoundError(
+                        f"Unknown resource: {uri!r} version {version!r}"
+                    )
+                span.set_attributes(template.get_span_attributes())
+                params = template.matches(uri)
+                assert params is not None
+                if task_meta is not None and task_meta.fn_key is None:
+                    task_meta = replace(task_meta, fn_key=template.key)
+                try:
+                    return await template._read(uri, params, task_meta=task_meta)
+                except (FastMCPError, McpError):
+                    logger.exception(f"Error reading resource {uri!r}")
+                    raise
+                except Exception as e:
+                    logger.exception(f"Error reading resource {uri!r}")
+                    if self._mask_error_details:
+                        raise ResourceError(f"Error reading resource {uri!r}") from e
+                    raise ResourceError(f"Error reading resource {uri!r}: {e}") from e
+
+    @overload
+    async def render_prompt(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        version: VersionSpec | None = None,
+        run_middleware: bool = True,
+        task_meta: None = None,
+    ) -> PromptResult: ...
+
+    @overload
+    async def render_prompt(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        version: VersionSpec | None = None,
+        run_middleware: bool = True,
+        task_meta: TaskMeta,
+    ) -> mcp.types.CreateTaskResult: ...
+
+    async def render_prompt(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        version: VersionSpec | None = None,
+        run_middleware: bool = True,
+        task_meta: TaskMeta | None = None,
+    ) -> PromptResult | mcp.types.CreateTaskResult:
+        """Render a prompt by name.
+
+        This is the public API for rendering prompts. By default, middleware is applied.
+        Use get_prompt() to retrieve the prompt definition without rendering.
+
+        Args:
+            name: The prompt name
+            arguments: Prompt arguments (optional)
+            version: Specific version to render. If None, renders highest version.
+            run_middleware: If True (default), apply the middleware chain.
+                Set to False when called from middleware to avoid re-applying.
+            task_meta: If provided, execute as a background task and return
+                CreateTaskResult. If None (default), execute synchronously and
+                return PromptResult.
+
+        Returns:
+            PromptResult when task_meta is None.
+            CreateTaskResult when task_meta is provided.
+
+        Raises:
+            NotFoundError: If prompt not found or disabled
+            PromptError: If prompt rendering fails
+        """
+        async with fastmcp.server.context.Context(fastmcp=self) as ctx:
+            if run_middleware:
+                mw_context = MiddlewareContext(
+                    message=mcp.types.GetPromptRequestParams(
+                        name=name, arguments=arguments
+                    ),
+                    source="client",
+                    type="request",
+                    method="prompts/get",
+                    fastmcp_context=ctx,
+                )
+                return await self._run_middleware(
+                    context=mw_context,
+                    call_next=lambda context: self.render_prompt(
+                        context.message.name,
+                        context.message.arguments,
+                        version=version,
+                        run_middleware=False,
+                        task_meta=task_meta,
+                    ),
+                )
+
+            # Core logic: find and render prompt (providers queried in parallel)
+            # Use _get_prompt to apply transforms (including visibility)
+            with server_span(
+                f"prompts/get {name}", "prompts/get", self.name, "prompt", name
+            ) as span:
+                prompt = await self.get_prompt(name, version=version)
+                if prompt is None:
+                    raise NotFoundError(f"Unknown prompt: {name!r}")
+                span.set_attributes(prompt.get_span_attributes())
+                if task_meta is not None and task_meta.fn_key is None:
+                    task_meta = replace(task_meta, fn_key=prompt.key)
+                try:
+                    return await prompt._render(arguments, task_meta=task_meta)
+                except (FastMCPError, McpError):
+                    logger.exception(f"Error rendering prompt {name!r}")
+                    raise
+                except Exception as e:
+                    logger.exception(f"Error rendering prompt {name!r}")
+                    if self._mask_error_details:
+                        raise PromptError(f"Error rendering prompt {name!r}") from e
+                    raise PromptError(f"Error rendering prompt {name!r}: {e}") from e
 
     def custom_route(
         self,
@@ -502,413 +1903,313 @@ class FastMCP(Generic[LifespanResultT]):
         return decorator
 
     def _get_additional_http_routes(self) -> list[BaseRoute]:
-        """Get all additional HTTP routes including from mounted servers.
+        """Get all additional HTTP routes including from providers.
 
         Returns a list of all custom HTTP routes from this server and
-        recursively from all mounted servers.
+        from all providers that have HTTP routes (e.g., FastMCPProvider).
 
         Returns:
             List of Starlette BaseRoute objects
         """
-        routes = list(self._additional_http_routes)
+        return list(self._additional_http_routes)
 
-        # Recursively get routes from mounted servers
-        for mounted_server in self._mounted_servers:
-            mounted_routes = mounted_server.server._get_additional_http_routes()
-            routes.extend(mounted_routes)
-
-        return routes
-
-    async def _mcp_list_tools(self) -> list[MCPTool]:
+    async def _list_tools_mcp(
+        self, request: mcp.types.ListToolsRequest
+    ) -> mcp.types.ListToolsResult:
+        """
+        List all available tools, in the format expected by the low-level MCP
+        server. Supports pagination when list_page_size is configured.
+        """
         logger.debug(f"[{self.name}] Handler called: list_tools")
 
         async with fastmcp.server.context.Context(fastmcp=self):
-            tools = await self._list_tools()
-            return [
-                tool.to_mcp_tool(
-                    name=tool.key,
-                    include_fastmcp_meta=self.include_fastmcp_meta,
-                )
-                for tool in tools
-            ]
-
-    async def _list_tools(self) -> list[Tool]:
-        """
-        List all available tools, in the format expected by the low-level MCP
-        server.
-        """
-
-        async def _handler(
-            context: MiddlewareContext[mcp.types.ListToolsRequest],
-        ) -> list[Tool]:
-            tools = await self._tool_manager.list_tools()  # type: ignore[reportPrivateUsage]
-
-            mcp_tools: list[Tool] = []
-            for tool in tools:
-                if self._should_enable_component(tool):
-                    mcp_tools.append(tool)
-
-            return mcp_tools
-
-        async with fastmcp.server.context.Context(fastmcp=self) as fastmcp_ctx:
-            # Create the middleware context.
-            mw_context = MiddlewareContext(
-                message=mcp.types.ListToolsRequest(method="tools/list"),
-                source="client",
-                type="request",
-                method="tools/list",
-                fastmcp_context=fastmcp_ctx,
+            tools = await self.get_tools(run_middleware=True)
+            sdk_tools = [tool.to_mcp_tool(name=tool.name) for tool in tools]
+            # SDK may pass None for internal cache refresh despite type hint
+            cursor = (
+                request.params.cursor  # type: ignore[union-attr]
+                if request is not None and request.params
+                else None
             )
+            page, next_cursor = _apply_pagination(
+                sdk_tools, cursor, self._list_page_size
+            )
+            return mcp.types.ListToolsResult(tools=page, nextCursor=next_cursor)
 
-            # Apply the middleware chain.
-            return await self._apply_middleware(mw_context, _handler)
-
-    async def _mcp_list_resources(self) -> list[MCPResource]:
+    async def _list_resources_mcp(
+        self, request: mcp.types.ListResourcesRequest
+    ) -> mcp.types.ListResourcesResult:
+        """
+        List all available resources, in the format expected by the low-level MCP
+        server. Supports pagination when list_page_size is configured.
+        """
         logger.debug(f"[{self.name}] Handler called: list_resources")
 
         async with fastmcp.server.context.Context(fastmcp=self):
-            resources = await self._list_resources()
-            return [
-                resource.to_mcp_resource(
-                    uri=resource.key,
-                    include_fastmcp_meta=self.include_fastmcp_meta,
-                )
+            resources = await self.get_resources(run_middleware=True)
+            sdk_resources = [
+                resource.to_mcp_resource(uri=str(resource.uri))
                 for resource in resources
             ]
-
-    async def _list_resources(self) -> list[Resource]:
-        """
-        List all available resources, in the format expected by the low-level MCP
-        server.
-
-        """
-
-        async def _handler(
-            context: MiddlewareContext[dict[str, Any]],
-        ) -> list[Resource]:
-            resources = await self._resource_manager.list_resources()  # type: ignore[reportPrivateUsage]
-
-            mcp_resources: list[Resource] = []
-            for resource in resources:
-                if self._should_enable_component(resource):
-                    mcp_resources.append(resource)
-
-            return mcp_resources
-
-        async with fastmcp.server.context.Context(fastmcp=self) as fastmcp_ctx:
-            # Create the middleware context.
-            mw_context = MiddlewareContext(
-                message={},  # List resources doesn't have parameters
-                source="client",
-                type="request",
-                method="resources/list",
-                fastmcp_context=fastmcp_ctx,
+            cursor = request.params.cursor if request.params else None
+            page, next_cursor = _apply_pagination(
+                sdk_resources, cursor, self._list_page_size
             )
+            return mcp.types.ListResourcesResult(resources=page, nextCursor=next_cursor)
 
-            # Apply the middleware chain.
-            return await self._apply_middleware(mw_context, _handler)
-
-    async def _mcp_list_resource_templates(self) -> list[MCPResourceTemplate]:
-        logger.debug(f"[{self.name}] Handler called: list_resource_templates")
-
-        async with fastmcp.server.context.Context(fastmcp=self):
-            templates = await self._list_resource_templates()
-            return [
-                template.to_mcp_template(
-                    uriTemplate=template.key,
-                    include_fastmcp_meta=self.include_fastmcp_meta,
-                )
-                for template in templates
-            ]
-
-    async def _list_resource_templates(self) -> list[ResourceTemplate]:
+    async def _list_resource_templates_mcp(
+        self, request: mcp.types.ListResourceTemplatesRequest
+    ) -> mcp.types.ListResourceTemplatesResult:
         """
         List all available resource templates, in the format expected by the low-level MCP
-        server.
-
+        server. Supports pagination when list_page_size is configured.
         """
-
-        async def _handler(
-            context: MiddlewareContext[dict[str, Any]],
-        ) -> list[ResourceTemplate]:
-            templates = await self._resource_manager.list_resource_templates()
-
-            mcp_templates: list[ResourceTemplate] = []
-            for template in templates:
-                if self._should_enable_component(template):
-                    mcp_templates.append(template)
-
-            return mcp_templates
+        logger.debug(f"[{self.name}] Handler called: list_resource_templates")
 
         async with fastmcp.server.context.Context(fastmcp=self) as fastmcp_ctx:
-            # Create the middleware context.
             mw_context = MiddlewareContext(
-                message={},  # List resource templates doesn't have parameters
+                message={},
                 source="client",
                 type="request",
                 method="resources/templates/list",
                 fastmcp_context=fastmcp_ctx,
             )
-
-            # Apply the middleware chain.
-            return await self._apply_middleware(mw_context, _handler)
-
-    async def _mcp_list_prompts(self) -> list[MCPPrompt]:
-        logger.debug(f"[{self.name}] Handler called: list_prompts")
-
-        async with fastmcp.server.context.Context(fastmcp=self):
-            prompts = await self._list_prompts()
-            return [
-                prompt.to_mcp_prompt(
-                    name=prompt.key,
-                    include_fastmcp_meta=self.include_fastmcp_meta,
-                )
-                for prompt in prompts
+            templates = await self._run_middleware(
+                context=mw_context,
+                call_next=lambda context: self.get_resource_templates(),
+            )
+            sdk_templates = [
+                template.to_mcp_template(uriTemplate=template.uri_template)
+                for template in templates
             ]
+            cursor = request.params.cursor if request.params else None
+            page, next_cursor = _apply_pagination(
+                sdk_templates, cursor, self._list_page_size
+            )
+            return mcp.types.ListResourceTemplatesResult(
+                resourceTemplates=page, nextCursor=next_cursor
+            )
 
-    async def _list_prompts(self) -> list[Prompt]:
+    async def _list_prompts_mcp(
+        self, request: mcp.types.ListPromptsRequest
+    ) -> mcp.types.ListPromptsResult:
         """
         List all available prompts, in the format expected by the low-level MCP
-        server.
-
+        server. Supports pagination when list_page_size is configured.
         """
-
-        async def _handler(
-            context: MiddlewareContext[mcp.types.ListPromptsRequest],
-        ) -> list[Prompt]:
-            prompts = await self._prompt_manager.list_prompts()  # type: ignore[reportPrivateUsage]
-
-            mcp_prompts: list[Prompt] = []
-            for prompt in prompts:
-                if self._should_enable_component(prompt):
-                    mcp_prompts.append(prompt)
-
-            return mcp_prompts
+        logger.debug(f"[{self.name}] Handler called: list_prompts")
 
         async with fastmcp.server.context.Context(fastmcp=self) as fastmcp_ctx:
-            # Create the middleware context.
             mw_context = MiddlewareContext(
-                message=mcp.types.ListPromptsRequest(method="prompts/list"),
+                message={},
                 source="client",
                 type="request",
                 method="prompts/list",
                 fastmcp_context=fastmcp_ctx,
             )
+            prompts = await self._run_middleware(
+                context=mw_context,
+                call_next=lambda context: self.get_prompts(),
+            )
+            sdk_prompts = [prompt.to_mcp_prompt(name=prompt.name) for prompt in prompts]
+            cursor = request.params.cursor if request.params else None
+            page, next_cursor = _apply_pagination(
+                sdk_prompts, cursor, self._list_page_size
+            )
+            return mcp.types.ListPromptsResult(prompts=page, nextCursor=next_cursor)
 
-            # Apply the middleware chain.
-            return await self._apply_middleware(mw_context, _handler)
-
-    async def _mcp_call_tool(
+    async def _call_tool_mcp(
         self, key: str, arguments: dict[str, Any]
-    ) -> list[ContentBlock] | tuple[list[ContentBlock], dict[str, Any]]:
+    ) -> (
+        list[ContentBlock]
+        | tuple[list[ContentBlock], dict[str, Any]]
+        | mcp.types.CallToolResult
+        | mcp.types.CreateTaskResult
+    ):
         """
         Handle MCP 'callTool' requests.
 
-        Delegates to _call_tool, which should be overridden by FastMCP subclasses.
+        Extracts task metadata from MCP request context and passes it explicitly
+        to call_tool(). The tool's _run() method handles the backgrounding decision,
+        ensuring middleware runs before Docket.
 
         Args:
             key: The name of the tool to call
             arguments: Arguments to pass to the tool
 
         Returns:
-            List of MCP Content objects containing the tool results
+            Tool result or CreateTaskResult for background execution
         """
         logger.debug(
             f"[{self.name}] Handler called: call_tool %s with %s", key, arguments
         )
 
-        async with fastmcp.server.context.Context(fastmcp=self):
+        try:
+            # Extract version and task metadata from request context.
+            # fn_key is set by call_tool() after finding the tool.
+            version_str: str | None = None
+            task_meta: TaskMeta | None = None
             try:
-                result = await self._call_tool(key, arguments)
-                return result.to_mcp_result()
-            except DisabledError:
-                raise NotFoundError(f"Unknown tool: {key}")
-            except NotFoundError:
-                raise NotFoundError(f"Unknown tool: {key}")
+                ctx = self._mcp_server.request_context
+                # Extract version from request-level _meta.fastmcp.version
+                if ctx.meta:
+                    meta_dict = ctx.meta.model_dump(exclude_none=True)
+                    version_str = meta_dict.get("fastmcp", {}).get("version")
+                # Extract SEP-1686 task metadata
+                if ctx.experimental.is_task:
+                    mcp_task_meta = ctx.experimental.task_metadata
+                    task_meta_dict = mcp_task_meta.model_dump(exclude_none=True)
+                    task_meta = TaskMeta(ttl=task_meta_dict.get("ttl"))
+            except (AttributeError, LookupError):
+                pass
 
-    async def _call_tool(self, key: str, arguments: dict[str, Any]) -> ToolResult:
-        """
-        Applies this server's middleware and delegates the filtered call to the manager.
-        """
-
-        async def _handler(
-            context: MiddlewareContext[mcp.types.CallToolRequestParams],
-        ) -> ToolResult:
-            tool = await self._tool_manager.get_tool(context.message.name)
-            if not self._should_enable_component(tool):
-                raise NotFoundError(f"Unknown tool: {context.message.name!r}")
-
-            return await self._tool_manager.call_tool(
-                key=context.message.name, arguments=context.message.arguments or {}
+            version = VersionSpec(eq=version_str) if version_str else None
+            result = await self.call_tool(
+                key, arguments, version=version, task_meta=task_meta
             )
 
-        mw_context = MiddlewareContext[CallToolRequestParams](
-            message=mcp.types.CallToolRequestParams(name=key, arguments=arguments),
-            source="client",
-            type="request",
-            method="tools/call",
-            fastmcp_context=fastmcp.server.dependencies.get_context(),
-        )
-        return await self._apply_middleware(mw_context, _handler)
+            if isinstance(result, mcp.types.CreateTaskResult):
+                return result
+            return result.to_mcp_result()
 
-    async def _mcp_read_resource(self, uri: AnyUrl | str) -> list[ReadResourceContents]:
-        """
-        Handle MCP 'readResource' requests.
+        except DisabledError as e:
+            raise NotFoundError(f"Unknown tool: {key!r}") from e
+        except NotFoundError as e:
+            raise NotFoundError(f"Unknown tool: {key!r}") from e
 
-        Delegates to _read_resource, which should be overridden by FastMCP subclasses.
+    async def _read_resource_mcp(
+        self, uri: AnyUrl | str
+    ) -> mcp.types.ReadResourceResult | mcp.types.CreateTaskResult:
+        """Handle MCP 'readResource' requests.
+
+        Extracts task metadata from MCP request context and passes it explicitly
+        to read_resource(). The resource's _read() method handles the backgrounding
+        decision, ensuring middleware runs before Docket.
+
+        Args:
+            uri: The resource URI
+
+        Returns:
+            ReadResourceResult or CreateTaskResult for background execution
         """
         logger.debug(f"[{self.name}] Handler called: read_resource %s", uri)
 
-        async with fastmcp.server.context.Context(fastmcp=self):
+        try:
+            # Extract version and task metadata from request context.
+            version_str: str | None = None
+            task_meta: TaskMeta | None = None
             try:
-                return await self._read_resource(uri)
-            except DisabledError:
-                # convert to NotFoundError to avoid leaking resource presence
-                raise NotFoundError(f"Unknown resource: {str(uri)!r}")
-            except NotFoundError:
-                # standardize NotFound message
-                raise NotFoundError(f"Unknown resource: {str(uri)!r}")
+                ctx = self._mcp_server.request_context
+                # Extract version from _meta.fastmcp.version if provided
+                if ctx.meta:
+                    meta_dict = ctx.meta.model_dump(exclude_none=True)
+                    fastmcp_meta = meta_dict.get("fastmcp") or {}
+                    version_str = fastmcp_meta.get("version")
+                # Extract SEP-1686 task metadata
+                if ctx.experimental.is_task:
+                    mcp_task_meta = ctx.experimental.task_metadata
+                    task_meta_dict = mcp_task_meta.model_dump(exclude_none=True)
+                    task_meta = TaskMeta(ttl=task_meta_dict.get("ttl"))
+            except (AttributeError, LookupError):
+                pass
 
-    async def _read_resource(self, uri: AnyUrl | str) -> list[ReadResourceContents]:
+            version = VersionSpec(eq=version_str) if version_str else None
+            result = await self.read_resource(
+                str(uri), version=version, task_meta=task_meta
+            )
+
+            if isinstance(result, mcp.types.CreateTaskResult):
+                return result
+            return result.to_mcp_result(uri)
+        except DisabledError as e:
+            raise NotFoundError(f"Unknown resource: {str(uri)!r}") from e
+        except NotFoundError:
+            raise
+
+    async def _get_prompt_mcp(
+        self, name: str, arguments: dict[str, Any] | None
+    ) -> mcp.types.GetPromptResult | mcp.types.CreateTaskResult:
+        """Handle MCP 'getPrompt' requests.
+
+        Extracts task metadata from MCP request context and passes it explicitly
+        to render_prompt(). The prompt's _render() method handles the backgrounding
+        decision, ensuring middleware runs before Docket.
+
+        Args:
+            name: The prompt name
+            arguments: Prompt arguments
+
+        Returns:
+            GetPromptResult or CreateTaskResult for background execution
         """
-        Applies this server's middleware and delegates the filtered call to the manager.
-        """
-
-        async def _handler(
-            context: MiddlewareContext[mcp.types.ReadResourceRequestParams],
-        ) -> list[ReadResourceContents]:
-            resource = await self._resource_manager.get_resource(context.message.uri)
-            if not self._should_enable_component(resource):
-                raise NotFoundError(f"Unknown resource: {str(context.message.uri)!r}")
-
-            content = await self._resource_manager.read_resource(context.message.uri)
-            return [
-                ReadResourceContents(
-                    content=content,
-                    mime_type=resource.mime_type,
-                )
-            ]
-
-        # Convert string URI to AnyUrl if needed
-        if isinstance(uri, str):
-            uri_param = AnyUrl(uri)
-        else:
-            uri_param = uri
-
-        mw_context = MiddlewareContext(
-            message=mcp.types.ReadResourceRequestParams(uri=uri_param),
-            source="client",
-            type="request",
-            method="resources/read",
-            fastmcp_context=fastmcp.server.dependencies.get_context(),
-        )
-        return await self._apply_middleware(mw_context, _handler)
-
-    async def _mcp_get_prompt(
-        self, name: str, arguments: dict[str, Any] | None = None
-    ) -> GetPromptResult:
-        """
-        Handle MCP 'getPrompt' requests.
-
-        Delegates to _get_prompt, which should be overridden by FastMCP subclasses.
-        """
-        import fastmcp.server.context
-
         logger.debug(
             f"[{self.name}] Handler called: get_prompt %s with %s", name, arguments
         )
 
-        async with fastmcp.server.context.Context(fastmcp=self):
+        try:
+            # Extract version and task metadata from request context.
+            # fn_key is set by render_prompt() after finding the prompt.
+            version_str: str | None = None
+            task_meta: TaskMeta | None = None
             try:
-                return await self._get_prompt(name, arguments)
-            except DisabledError:
-                # convert to NotFoundError to avoid leaking prompt presence
-                raise NotFoundError(f"Unknown prompt: {name}")
-            except NotFoundError:
-                # standardize NotFound message
-                raise NotFoundError(f"Unknown prompt: {name}")
+                ctx = self._mcp_server.request_context
+                # Extract version from request-level _meta.fastmcp.version
+                if ctx.meta:
+                    meta_dict = ctx.meta.model_dump(exclude_none=True)
+                    version_str = meta_dict.get("fastmcp", {}).get("version")
+                # Extract SEP-1686 task metadata
+                if ctx.experimental.is_task:
+                    mcp_task_meta = ctx.experimental.task_metadata
+                    task_meta_dict = mcp_task_meta.model_dump(exclude_none=True)
+                    task_meta = TaskMeta(ttl=task_meta_dict.get("ttl"))
+            except (AttributeError, LookupError):
+                pass
 
-    async def _get_prompt(
-        self, name: str, arguments: dict[str, Any] | None = None
-    ) -> GetPromptResult:
-        """
-        Applies this server's middleware and delegates the filtered call to the manager.
-        """
-
-        async def _handler(
-            context: MiddlewareContext[mcp.types.GetPromptRequestParams],
-        ) -> GetPromptResult:
-            prompt = await self._prompt_manager.get_prompt(context.message.name)
-            if not self._should_enable_component(prompt):
-                raise NotFoundError(f"Unknown prompt: {context.message.name!r}")
-
-            return await self._prompt_manager.render_prompt(
-                name=context.message.name, arguments=context.message.arguments
+            version = VersionSpec(eq=version_str) if version_str else None
+            result = await self.render_prompt(
+                name, arguments, version=version, task_meta=task_meta
             )
 
-        mw_context = MiddlewareContext(
-            message=mcp.types.GetPromptRequestParams(name=name, arguments=arguments),
-            source="client",
-            type="request",
-            method="prompts/get",
-            fastmcp_context=fastmcp.server.dependencies.get_context(),
-        )
-        return await self._apply_middleware(mw_context, _handler)
+            if isinstance(result, mcp.types.CreateTaskResult):
+                return result
+            return result.to_mcp_prompt_result()
+        except DisabledError as e:
+            raise NotFoundError(f"Unknown prompt: {name!r}") from e
+        except NotFoundError:
+            raise
 
-    def add_tool(self, tool: Tool) -> Tool:
+    def add_tool(self, tool: Tool | Callable[..., Any]) -> Tool:
         """Add a tool to the server.
 
         The tool function can optionally request a Context object by adding a parameter
         with the Context type annotation. See the @tool decorator for examples.
 
         Args:
-            tool: The Tool instance to register
+            tool: The Tool instance or @tool-decorated function to register
 
         Returns:
             The tool instance that was added to the server.
         """
-        self._tool_manager.add_tool(tool)
+        return self._local_provider.add_tool(tool)
 
-        # Send notification if we're in a request context
-        try:
-            from fastmcp.server.dependencies import get_context
-
-            context = get_context()
-            context._queue_tool_list_changed()  # type: ignore[private-use]
-        except RuntimeError:
-            pass  # No context available
-
-        return tool
-
-    def remove_tool(self, name: str) -> None:
-        """Remove a tool from the server.
+    def remove_tool(self, name: str, version: str | None = None) -> None:
+        """Remove tool(s) from the server.
 
         Args:
-            name: The name of the tool to remove
+            name: The name of the tool to remove.
+            version: If None, removes ALL versions. If specified, removes only that version.
 
         Raises:
-            NotFoundError: If the tool is not found
+            NotFoundError: If no matching tool is found.
         """
-        self._tool_manager.remove_tool(name)
-
-        # Send notification if we're in a request context
         try:
-            from fastmcp.server.dependencies import get_context
-
-            context = get_context()
-            context._queue_tool_list_changed()  # type: ignore[private-use]
-        except RuntimeError:
-            pass  # No context available
-
-    def add_tool_transformation(
-        self, tool_name: str, transformation: ToolTransformConfig
-    ) -> None:
-        """Add a tool transformation."""
-        self._tool_manager.add_tool_transformation(tool_name, transformation)
-
-    def remove_tool_transformation(self, tool_name: str) -> None:
-        """Remove a tool transformation."""
-        self._tool_manager.remove_tool_transformation(tool_name)
+            self._local_provider.remove_tool(name, version)
+        except KeyError:
+            if version is None:
+                raise NotFoundError(f"Tool {name!r} not found") from None
+            raise NotFoundError(
+                f"Tool {name!r} version {version!r} not found"
+            ) from None
 
     @overload
     def tool(
@@ -916,14 +2217,18 @@ class FastMCP(Generic[LifespanResultT]):
         name_or_fn: AnyFunction,
         *,
         name: str | None = None,
+        version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[mcp.types.Icon] | None = None,
         tags: set[str] | None = None,
-        output_schema: dict[str, Any] | None | NotSetT = NotSet,
+        output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
         exclude_args: list[str] | None = None,
         meta: dict[str, Any] | None = None,
-        enabled: bool | None = None,
+        task: bool | TaskConfig | None = None,
+        timeout: float | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> FunctionTool: ...
 
     @overload
@@ -932,14 +2237,18 @@ class FastMCP(Generic[LifespanResultT]):
         name_or_fn: str | None = None,
         *,
         name: str | None = None,
+        version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[mcp.types.Icon] | None = None,
         tags: set[str] | None = None,
-        output_schema: dict[str, Any] | None | NotSetT = NotSet,
+        output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
         exclude_args: list[str] | None = None,
         meta: dict[str, Any] | None = None,
-        enabled: bool | None = None,
+        task: bool | TaskConfig | None = None,
+        timeout: float | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> Callable[[AnyFunction], FunctionTool]: ...
 
     def tool(
@@ -947,15 +2256,23 @@ class FastMCP(Generic[LifespanResultT]):
         name_or_fn: str | AnyFunction | None = None,
         *,
         name: str | None = None,
+        version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[mcp.types.Icon] | None = None,
         tags: set[str] | None = None,
-        output_schema: dict[str, Any] | None | NotSetT = NotSet,
+        output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
         exclude_args: list[str] | None = None,
         meta: dict[str, Any] | None = None,
-        enabled: bool | None = None,
-    ) -> Callable[[AnyFunction], FunctionTool] | FunctionTool:
+        task: bool | TaskConfig | None = None,
+        timeout: float | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+    ) -> (
+        Callable[[AnyFunction], FunctionTool]
+        | FunctionTool
+        | partial[Callable[[AnyFunction], FunctionTool] | FunctionTool]
+    ):
         """Decorator to register a tool.
 
         Tools can optionally request a Context object by adding a parameter with the
@@ -976,9 +2293,9 @@ class FastMCP(Generic[LifespanResultT]):
             tags: Optional set of tags for categorizing the tool
             output_schema: Optional JSON schema for the tool's output
             annotations: Optional annotations about the tool's behavior
-            exclude_args: Optional list of argument names to exclude from the tool schema
+            exclude_args: Optional list of argument names to exclude from the tool schema.
+                Deprecated: Use `Depends()` for dependency injection instead.
             meta: Optional meta information about the tool
-            enabled: Optional boolean to enable or disable the tool
 
         Examples:
             Register a tool with a custom name:
@@ -1004,96 +2321,39 @@ class FastMCP(Generic[LifespanResultT]):
             server.tool(my_function, name="custom_name")
             ```
         """
-        if isinstance(annotations, dict):
-            annotations = ToolAnnotations(**annotations)
-
-        if isinstance(name_or_fn, classmethod):
-            raise ValueError(
-                inspect.cleandoc(
-                    """
-                    To decorate a classmethod, first define the method and then call
-                    tool() directly on the method instead of using it as a
-                    decorator. See https://gofastmcp.com/patterns/decorating-methods
-                    for examples and more information.
-                    """
-                )
-            )
-
-        # Determine the actual name and function based on the calling pattern
-        if inspect.isroutine(name_or_fn):
-            # Case 1: @tool (without parens) - function passed directly
-            # Case 2: direct call like tool(fn, name="something")
-            fn = name_or_fn
-            tool_name = name  # Use keyword name if provided, otherwise None
-
-            # Register the tool immediately and return the tool object
-            tool = Tool.from_function(
-                fn,
-                name=tool_name,
-                title=title,
-                description=description,
-                tags=tags,
-                output_schema=output_schema,
-                annotations=cast(ToolAnnotations | None, annotations),
-                exclude_args=exclude_args,
-                meta=meta,
-                serializer=self._tool_serializer,
-                enabled=enabled,
-            )
-            self.add_tool(tool)
-            return tool
-
-        elif isinstance(name_or_fn, str):
-            # Case 3: @tool("custom_name") - name passed as first argument
-            if name is not None:
-                raise TypeError(
-                    "Cannot specify both a name as first argument and as keyword argument. "
-                    f"Use either @tool('{name_or_fn}') or @tool(name='{name}'), not both."
-                )
-            tool_name = name_or_fn
-        elif name_or_fn is None:
-            # Case 4: @tool or @tool(name="something") - use keyword name
-            tool_name = name
-        else:
-            raise TypeError(
-                f"First argument to @tool must be a function, string, or None, got {type(name_or_fn)}"
-            )
-
-        # Return partial for cases where we need to wait for the function
-        return partial(
-            self.tool,
-            name=tool_name,
+        # Delegate to LocalProvider with server-level defaults
+        result = self._local_provider.tool(
+            name_or_fn,
+            name=name,
+            version=version,
             title=title,
             description=description,
+            icons=icons,
             tags=tags,
             output_schema=output_schema,
             annotations=annotations,
             exclude_args=exclude_args,
             meta=meta,
-            enabled=enabled,
+            task=task if task is not None else self._support_tasks_by_default,
+            timeout=timeout,
+            serializer=self._tool_serializer,
+            auth=auth,
         )
 
-    def add_resource(self, resource: Resource) -> Resource:
+        return result
+
+    def add_resource(
+        self, resource: Resource | Callable[..., Any]
+    ) -> Resource | ResourceTemplate:
         """Add a resource to the server.
 
         Args:
-            resource: A Resource instance to add
+            resource: A Resource instance or @resource-decorated function to add
 
         Returns:
             The resource instance that was added to the server.
         """
-        self._resource_manager.add_resource(resource)
-
-        # Send notification if we're in a request context
-        try:
-            from fastmcp.server.dependencies import get_context
-
-            context = get_context()
-            context._queue_resource_list_changed()  # type: ignore[private-use]
-        except RuntimeError:
-            pass  # No context available
-
-        return resource
+        return self._local_provider.add_resource(resource)
 
     def add_template(self, template: ResourceTemplate) -> ResourceTemplate:
         """Add a resource template to the server.
@@ -1104,70 +2364,24 @@ class FastMCP(Generic[LifespanResultT]):
         Returns:
             The template instance that was added to the server.
         """
-        self._resource_manager.add_template(template)
-
-        # Send notification if we're in a request context
-        try:
-            from fastmcp.server.dependencies import get_context
-
-            context = get_context()
-            context._queue_resource_list_changed()  # type: ignore[private-use]
-        except RuntimeError:
-            pass  # No context available
-
-        return template
-
-    def add_resource_fn(
-        self,
-        fn: AnyFunction,
-        uri: str,
-        name: str | None = None,
-        description: str | None = None,
-        mime_type: str | None = None,
-        tags: set[str] | None = None,
-    ) -> None:
-        """Add a resource or template to the server from a function.
-
-        If the URI contains parameters (e.g. "resource://{param}") or the function
-        has parameters, it will be registered as a template resource.
-
-        Args:
-            fn: The function to register as a resource
-            uri: The URI for the resource
-            name: Optional name for the resource
-            description: Optional description of the resource
-            mime_type: Optional MIME type for the resource
-            tags: Optional set of tags for categorizing the resource
-        """
-        # deprecated since 2.7.0
-        if fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "The add_resource_fn method is deprecated. Use the resource decorator instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        self._resource_manager.add_resource_or_template_from_fn(
-            fn=fn,
-            uri=uri,
-            name=name,
-            description=description,
-            mime_type=mime_type,
-            tags=tags,
-        )
+        return self._local_provider.add_template(template)
 
     def resource(
         self,
         uri: str,
         *,
         name: str | None = None,
+        version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[mcp.types.Icon] | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
-        enabled: bool | None = None,
         annotations: Annotations | dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
-    ) -> Callable[[AnyFunction], Resource | ResourceTemplate]:
+        task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+    ) -> Callable[[AnyFunction], Resource | ResourceTemplate | AnyFunction]:
         """Decorator to register a function as a resource.
 
         The function will be called when the resource is read to generate its content.
@@ -1189,7 +2403,6 @@ class FastMCP(Generic[LifespanResultT]):
             description: Optional description of the resource
             mime_type: Optional MIME type for the resource
             tags: Optional set of tags for categorizing the resource
-            enabled: Optional boolean to enable or disable the resource
             annotations: Optional annotations about the resource's behavior
             meta: Optional meta information about the resource
 
@@ -1220,99 +2433,37 @@ class FastMCP(Generic[LifespanResultT]):
                 return f"Weather for {city}: {data}"
             ```
         """
-        if isinstance(annotations, dict):
-            annotations = Annotations(**annotations)
+        # Delegate to LocalProvider with server-level defaults
+        inner_decorator = self._local_provider.resource(
+            uri,
+            name=name,
+            version=version,
+            title=title,
+            description=description,
+            icons=icons,
+            mime_type=mime_type,
+            tags=tags,
+            annotations=annotations,
+            meta=meta,
+            task=task if task is not None else self._support_tasks_by_default,
+            auth=auth,
+        )
 
-        # Check if user passed function directly instead of calling decorator
-        if inspect.isroutine(uri):
-            raise TypeError(
-                "The @resource decorator was used incorrectly. "
-                "Did you forget to call it? Use @resource('uri') instead of @resource"
-            )
-
-        def decorator(fn: AnyFunction) -> Resource | ResourceTemplate:
-            from fastmcp.server.context import Context
-
-            if isinstance(fn, classmethod):  # type: ignore[reportUnnecessaryIsInstance]
-                raise ValueError(
-                    inspect.cleandoc(
-                        """
-                        To decorate a classmethod, first define the method and then call
-                        resource() directly on the method instead of using it as a
-                        decorator. See https://gofastmcp.com/patterns/decorating-methods
-                        for examples and more information.
-                        """
-                    )
-                )
-
-            # Check if this should be a template
-            has_uri_params = "{" in uri and "}" in uri
-            # check if the function has any parameters (other than injected context)
-            has_func_params = any(
-                p
-                for p in inspect.signature(fn).parameters.values()
-                if p.annotation is not Context
-            )
-
-            if has_uri_params or has_func_params:
-                template = ResourceTemplate.from_function(
-                    fn=fn,
-                    uri_template=uri,
-                    name=name,
-                    title=title,
-                    description=description,
-                    mime_type=mime_type,
-                    tags=tags,
-                    enabled=enabled,
-                    annotations=cast(Annotations | None, annotations),
-                    meta=meta,
-                )
-                self.add_template(template)
-                return template
-            elif not has_uri_params and not has_func_params:
-                resource = Resource.from_function(
-                    fn=fn,
-                    uri=uri,
-                    name=name,
-                    title=title,
-                    description=description,
-                    mime_type=mime_type,
-                    tags=tags,
-                    enabled=enabled,
-                    annotations=cast(Annotations | None, annotations),
-                    meta=meta,
-                )
-                self.add_resource(resource)
-                return resource
-            else:
-                raise ValueError(
-                    "Invalid resource or template definition due to a "
-                    "mismatch between URI parameters and function parameters."
-                )
+        def decorator(fn: AnyFunction) -> Resource | ResourceTemplate | AnyFunction:
+            return inner_decorator(fn)
 
         return decorator
 
-    def add_prompt(self, prompt: Prompt) -> Prompt:
+    def add_prompt(self, prompt: Prompt | Callable[..., Any]) -> Prompt:
         """Add a prompt to the server.
 
         Args:
-            prompt: A Prompt instance to add
+            prompt: A Prompt instance or @prompt-decorated function to add
 
         Returns:
             The prompt instance that was added to the server.
         """
-        self._prompt_manager.add_prompt(prompt)
-
-        # Send notification if we're in a request context
-        try:
-            from fastmcp.server.dependencies import get_context
-
-            context = get_context()
-            context._queue_prompt_list_changed()  # type: ignore[private-use]
-        except RuntimeError:
-            pass  # No context available
-
-        return prompt
+        return self._local_provider.add_prompt(prompt)
 
     @overload
     def prompt(
@@ -1320,11 +2471,14 @@ class FastMCP(Generic[LifespanResultT]):
         name_or_fn: AnyFunction,
         *,
         name: str | None = None,
+        version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[mcp.types.Icon] | None = None,
         tags: set[str] | None = None,
-        enabled: bool | None = None,
         meta: dict[str, Any] | None = None,
+        task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> FunctionPrompt: ...
 
     @overload
@@ -1333,11 +2487,14 @@ class FastMCP(Generic[LifespanResultT]):
         name_or_fn: str | None = None,
         *,
         name: str | None = None,
+        version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[mcp.types.Icon] | None = None,
         tags: set[str] | None = None,
-        enabled: bool | None = None,
         meta: dict[str, Any] | None = None,
+        task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
     ) -> Callable[[AnyFunction], FunctionPrompt]: ...
 
     def prompt(
@@ -1345,12 +2502,19 @@ class FastMCP(Generic[LifespanResultT]):
         name_or_fn: str | AnyFunction | None = None,
         *,
         name: str | None = None,
+        version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[mcp.types.Icon] | None = None,
         tags: set[str] | None = None,
-        enabled: bool | None = None,
         meta: dict[str, Any] | None = None,
-    ) -> Callable[[AnyFunction], FunctionPrompt] | FunctionPrompt:
+        task: bool | TaskConfig | None = None,
+        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+    ) -> (
+        Callable[[AnyFunction], FunctionPrompt]
+        | FunctionPrompt
+        | partial[Callable[[AnyFunction], FunctionPrompt] | FunctionPrompt]
+    ):
         """Decorator to register a prompt.
 
         Prompts can optionally request a Context object by adding a parameter with the
@@ -1369,7 +2533,6 @@ class FastMCP(Generic[LifespanResultT]):
             name: Optional name for the prompt (keyword-only, alternative to name_or_fn)
             description: Optional description of what the prompt does
             tags: Optional set of tags for categorizing the prompt
-            enabled: Optional boolean to enable or disable the prompt
             meta: Optional meta information about the prompt
 
         Examples:
@@ -1420,93 +2583,61 @@ class FastMCP(Generic[LifespanResultT]):
             server.prompt(my_function, name="custom_name")
             ```
         """
-
-        if isinstance(name_or_fn, classmethod):
-            raise ValueError(
-                inspect.cleandoc(
-                    """
-                    To decorate a classmethod, first define the method and then call
-                    prompt() directly on the method instead of using it as a
-                    decorator. See https://gofastmcp.com/patterns/decorating-methods
-                    for examples and more information.
-                    """
-                )
-            )
-
-        # Determine the actual name and function based on the calling pattern
-        if inspect.isroutine(name_or_fn):
-            # Case 1: @prompt (without parens) - function passed directly as decorator
-            # Case 2: direct call like prompt(fn, name="something")
-            fn = name_or_fn
-            prompt_name = name  # Use keyword name if provided, otherwise None
-
-            # Register the prompt immediately
-            prompt = Prompt.from_function(
-                fn=fn,
-                name=prompt_name,
-                title=title,
-                description=description,
-                tags=tags,
-                enabled=enabled,
-                meta=meta,
-            )
-            self.add_prompt(prompt)
-
-            return prompt
-
-        elif isinstance(name_or_fn, str):
-            # Case 3: @prompt("custom_name") - name passed as first argument
-            if name is not None:
-                raise TypeError(
-                    "Cannot specify both a name as first argument and as keyword argument. "
-                    f"Use either @prompt('{name_or_fn}') or @prompt(name='{name}'), not both."
-                )
-            prompt_name = name_or_fn
-        elif name_or_fn is None:
-            # Case 4: @prompt() or @prompt(name="something") - use keyword name
-            prompt_name = name
-        else:
-            raise TypeError(
-                f"First argument to @prompt must be a function, string, or None, got {type(name_or_fn)}"
-            )
-
-        # Return partial for cases where we need to wait for the function
-        return partial(
-            self.prompt,
-            name=prompt_name,
+        # Delegate to LocalProvider with server-level defaults
+        return self._local_provider.prompt(
+            name_or_fn,
+            name=name,
+            version=version,
             title=title,
             description=description,
+            icons=icons,
             tags=tags,
-            enabled=enabled,
             meta=meta,
+            task=task if task is not None else self._support_tasks_by_default,
+            auth=auth,
         )
 
     async def run_stdio_async(
-        self, show_banner: bool = True, log_level: str | None = None
+        self,
+        show_banner: bool = True,
+        log_level: str | None = None,
+        stateless: bool = False,
     ) -> None:
         """Run the server using stdio transport.
 
         Args:
             show_banner: Whether to display the server banner
             log_level: Log level for the server
+            stateless: Whether to run in stateless mode (no session initialization)
         """
+        from fastmcp.server.context import reset_transport, set_transport
+
         # Display server banner
         if show_banner:
-            log_server_banner(
-                server=self,
-                transport="stdio",
-            )
+            log_server_banner(server=self)
 
-        with temporary_log_level(log_level):
-            async with stdio_server() as (read_stream, write_stream):
-                logger.info(f"Starting MCP server {self.name!r} with transport 'stdio'")
-                await self._mcp_server.run(
-                    read_stream,
-                    write_stream,
-                    self._mcp_server.create_initialization_options(
-                        NotificationOptions(tools_changed=True)
-                    ),
-                )
+        token = set_transport("stdio")
+        try:
+            with temporary_log_level(log_level):
+                async with self._lifespan_manager():
+                    async with stdio_server() as (read_stream, write_stream):
+                        mode = " (stateless)" if stateless else ""
+                        logger.info(
+                            f"Starting MCP server {self.name!r} with transport 'stdio'{mode}"
+                        )
+
+                        await self._mcp_server.run(
+                            read_stream,
+                            write_stream,
+                            self._mcp_server.create_initialization_options(
+                                notification_options=NotificationOptions(
+                                    tools_changed=True
+                                ),
+                            ),
+                            stateless=stateless,
+                        )
+        finally:
+            reset_transport(token)
 
     async def run_http_async(
         self,
@@ -1518,7 +2649,9 @@ class FastMCP(Generic[LifespanResultT]):
         path: str | None = None,
         uvicorn_config: dict[str, Any] | None = None,
         middleware: list[ASGIMiddleware] | None = None,
+        json_response: bool | None = None,
         stateless_http: bool | None = None,
+        stateless: bool | None = None,
     ) -> None:
         """Run the server using HTTP transport.
 
@@ -1530,8 +2663,22 @@ class FastMCP(Generic[LifespanResultT]):
             path: Path for the endpoint (defaults to settings.streamable_http_path or settings.sse_path)
             uvicorn_config: Additional configuration for the Uvicorn server
             middleware: A list of middleware to apply to the app
+            json_response: Whether to use JSON response format (defaults to settings.json_response)
             stateless_http: Whether to use stateless HTTP (defaults to settings.stateless_http)
+            stateless: Alias for stateless_http for CLI consistency
         """
+        # Allow stateless as alias for stateless_http
+        if stateless is not None and stateless_http is None:
+            stateless_http = stateless
+
+        # Resolve from settings/env var if not explicitly set
+        if stateless_http is None:
+            stateless_http = self._deprecated_settings.stateless_http
+
+        # SSE doesn't support stateless mode
+        if stateless_http and transport == "sse":
+            raise ValueError("SSE transport does not support stateless mode")
+
         host = host or self._deprecated_settings.host
         port = port or self._deprecated_settings.port
         default_log_level_to_use = (
@@ -1542,125 +2689,36 @@ class FastMCP(Generic[LifespanResultT]):
             path=path,
             transport=transport,
             middleware=middleware,
+            json_response=json_response,
             stateless_http=stateless_http,
-        )
-
-        # Get the path for the server URL
-        server_path = (
-            app.state.path.lstrip("/")
-            if hasattr(app, "state") and hasattr(app.state, "path")
-            else path or ""
         )
 
         # Display server banner
         if show_banner:
-            log_server_banner(
-                server=self,
-                transport=transport,
-                host=host,
-                port=port,
-                path=server_path,
-            )
-        _uvicorn_config_from_user = uvicorn_config or {}
+            log_server_banner(server=self)
+        uvicorn_config_from_user = uvicorn_config or {}
 
         config_kwargs: dict[str, Any] = {
             "timeout_graceful_shutdown": 0,
             "lifespan": "on",
+            "ws": "websockets-sansio",
         }
-        config_kwargs.update(_uvicorn_config_from_user)
+        config_kwargs.update(uvicorn_config_from_user)
 
         if "log_config" not in config_kwargs and "log_level" not in config_kwargs:
             config_kwargs["log_level"] = default_log_level_to_use
 
         with temporary_log_level(log_level):
-            config = uvicorn.Config(app, host=host, port=port, **config_kwargs)
-            server = uvicorn.Server(config)
-            path = app.state.path.lstrip("/")  # type: ignore
-            logger.info(
-                f"Starting MCP server {self.name!r} with transport {transport!r} on http://{host}:{port}/{path}"
-            )
+            async with self._lifespan_manager():
+                config = uvicorn.Config(app, host=host, port=port, **config_kwargs)
+                server = uvicorn.Server(config)
+                path = getattr(app.state, "path", "").lstrip("/")
+                mode = " (stateless)" if stateless_http else ""
+                logger.info(
+                    f"Starting MCP server {self.name!r} with transport {transport!r}{mode} on http://{host}:{port}/{path}"
+                )
 
-            await server.serve()
-
-    async def run_sse_async(
-        self,
-        host: str | None = None,
-        port: int | None = None,
-        log_level: str | None = None,
-        path: str | None = None,
-        uvicorn_config: dict[str, Any] | None = None,
-    ) -> None:
-        """Run the server using SSE transport."""
-
-        # Deprecated since 2.3.2
-        if fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "The run_sse_async method is deprecated (as of 2.3.2). Use run_http_async for a "
-                "modern (non-SSE) alternative, or create an SSE app with "
-                "`fastmcp.server.http.create_sse_app` and run it directly.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        await self.run_http_async(
-            transport="sse",
-            host=host,
-            port=port,
-            log_level=log_level,
-            path=path,
-            uvicorn_config=uvicorn_config,
-        )
-
-    def sse_app(
-        self,
-        path: str | None = None,
-        message_path: str | None = None,
-        middleware: list[ASGIMiddleware] | None = None,
-    ) -> StarletteWithLifespan:
-        """
-        Create a Starlette app for the SSE server.
-
-        Args:
-            path: The path to the SSE endpoint
-            message_path: The path to the message endpoint
-            middleware: A list of middleware to apply to the app
-        """
-        # Deprecated since 2.3.2
-        if fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "The sse_app method is deprecated (as of 2.3.2). Use http_app as a modern (non-SSE) "
-                "alternative, or call `fastmcp.server.http.create_sse_app` directly.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return create_sse_app(
-            server=self,
-            message_path=message_path or self._deprecated_settings.message_path,
-            sse_path=path or self._deprecated_settings.sse_path,
-            auth=self.auth,
-            debug=self._deprecated_settings.debug,
-            middleware=middleware,
-        )
-
-    def streamable_http_app(
-        self,
-        path: str | None = None,
-        middleware: list[ASGIMiddleware] | None = None,
-    ) -> StarletteWithLifespan:
-        """
-        Create a Starlette app for the StreamableHTTP server.
-
-        Args:
-            path: The path to the StreamableHTTP endpoint
-            middleware: A list of middleware to apply to the app
-        """
-        # Deprecated since 2.3.2
-        if fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "The streamable_http_app method is deprecated (as of 2.3.2). Use http_app() instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return self.http_app(path=path, middleware=middleware)
+                await server.serve()
 
     def http_app(
         self,
@@ -1669,13 +2727,24 @@ class FastMCP(Generic[LifespanResultT]):
         json_response: bool | None = None,
         stateless_http: bool | None = None,
         transport: Literal["http", "streamable-http", "sse"] = "http",
+        event_store: EventStore | None = None,
+        retry_interval: int | None = None,
     ) -> StarletteWithLifespan:
         """Create a Starlette app using the specified HTTP transport.
 
         Args:
             path: The path for the HTTP endpoint
             middleware: A list of middleware to apply to the app
-            transport: Transport protocol to use - either "streamable-http" (default) or "sse"
+            json_response: Whether to use JSON response format
+            stateless_http: Whether to use stateless mode (new transport per request)
+            transport: Transport protocol to use - "http", "streamable-http", or "sse"
+            event_store: Optional event store for SSE polling/resumability. When set,
+                enables clients to reconnect and resume receiving events after
+                server-initiated disconnections. Only used with streamable-http transport.
+            retry_interval: Optional retry interval in milliseconds for SSE polling.
+                Controls how quickly clients should reconnect after server-initiated
+                disconnections. Requires event_store to be set. Only used with
+                streamable-http transport.
 
         Returns:
             A Starlette application configured with the specified transport
@@ -1686,7 +2755,8 @@ class FastMCP(Generic[LifespanResultT]):
                 server=self,
                 streamable_http_path=path
                 or self._deprecated_settings.streamable_http_path,
-                event_store=None,
+                event_store=event_store,
+                retry_interval=retry_interval,
                 auth=self.auth,
                 json_response=(
                     json_response
@@ -1711,42 +2781,15 @@ class FastMCP(Generic[LifespanResultT]):
                 middleware=middleware,
             )
 
-    async def run_streamable_http_async(
-        self,
-        host: str | None = None,
-        port: int | None = None,
-        log_level: str | None = None,
-        path: str | None = None,
-        uvicorn_config: dict[str, Any] | None = None,
-    ) -> None:
-        # Deprecated since 2.3.2
-        if fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "The run_streamable_http_async method is deprecated (as of 2.3.2). "
-                "Use run_http_async instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        await self.run_http_async(
-            transport="http",
-            host=host,
-            port=port,
-            log_level=log_level,
-            path=path,
-            uvicorn_config=uvicorn_config,
-        )
-
     def mount(
         self,
         server: FastMCP[LifespanResultT],
-        prefix: str | None = None,
+        namespace: str | None = None,
         as_proxy: bool | None = None,
-        *,
-        tool_separator: str | None = None,
-        resource_separator: str | None = None,
-        prompt_separator: str | None = None,
+        tool_names: dict[str, str] | None = None,
+        prefix: str | None = None,  # deprecated, use namespace
     ) -> None:
-        """Mount another FastMCP server on this server with an optional prefix.
+        """Mount another FastMCP server on this server with an optional namespace.
 
         Unlike importing (with import_server), mounting establishes a dynamic connection
         between servers. When a client interacts with a mounted server's objects through
@@ -1754,121 +2797,97 @@ class FastMCP(Generic[LifespanResultT]):
         This means changes to the mounted server are immediately reflected when accessed
         through the parent.
 
-        When a server is mounted with a prefix:
-        - Tools from the mounted server are accessible with prefixed names.
-          Example: If server has a tool named "get_weather", it will be available as "prefix_get_weather".
-        - Resources are accessible with prefixed URIs.
+        When a server is mounted with a namespace:
+        - Tools from the mounted server are accessible with namespaced names.
+          Example: If server has a tool named "get_weather", it will be available as "namespace_get_weather".
+        - Resources are accessible with namespaced URIs.
           Example: If server has a resource with URI "weather://forecast", it will be available as
-          "weather://prefix/forecast".
-        - Templates are accessible with prefixed URI templates.
+          "weather://namespace/forecast".
+        - Templates are accessible with namespaced URI templates.
           Example: If server has a template with URI "weather://location/{id}", it will be available
-          as "weather://prefix/location/{id}".
-        - Prompts are accessible with prefixed names.
+          as "weather://namespace/location/{id}".
+        - Prompts are accessible with namespaced names.
           Example: If server has a prompt named "weather_prompt", it will be available as
-          "prefix_weather_prompt".
+          "namespace_weather_prompt".
 
-        When a server is mounted without a prefix (prefix=None), its tools, resources, templates,
+        When a server is mounted without a namespace (namespace=None), its tools, resources, templates,
         and prompts are accessible with their original names. Multiple servers can be mounted
-        without prefixes, and they will be tried in order until a match is found.
+        without namespaces, and they will be tried in order until a match is found.
 
-        There are two modes for mounting servers:
-        1. Direct mounting (default when server has no custom lifespan): The parent server
-           directly accesses the mounted server's objects in-memory for better performance.
-           In this mode, no client lifecycle events occur on the mounted server, including
-           lifespan execution.
-
-        2. Proxy mounting (default when server has a custom lifespan): The parent server
-           treats the mounted server as a separate entity and communicates with it via a
-           Client transport. This preserves all client-facing behaviors, including lifespan
-           execution, but with slightly higher overhead.
+        The mounted server's lifespan is executed when the parent server starts, and its
+        middleware chain is invoked for all operations (tool calls, resource reads, prompts).
 
         Args:
             server: The FastMCP server to mount.
-            prefix: Optional prefix to use for the mounted server's objects. If None,
+            namespace: Optional namespace to use for the mounted server's objects. If None,
                 the server's objects are accessible with their original names.
-            as_proxy: Whether to treat the mounted server as a proxy. If None (default),
-                automatically determined based on whether the server has a custom lifespan
-                (True if it has a custom lifespan, False otherwise).
-            tool_separator: Deprecated. Separator character for tool names.
-            resource_separator: Deprecated. Separator character for resource URIs.
-            prompt_separator: Deprecated. Separator character for prompt names.
+            as_proxy: Deprecated. Mounted servers now always have their lifespan and
+                middleware invoked. To create a proxy server, use create_proxy()
+                explicitly before mounting.
+            tool_names: Optional mapping of original tool names to custom names. Use this
+                to override namespaced names. Keys are the original tool names from the
+                mounted server.
+            prefix: Deprecated. Use namespace instead.
         """
-        from fastmcp.server.proxy import FastMCPProxy
+        import warnings
 
-        # Deprecated since 2.9.0
-        # Prior to 2.9.0, the first positional argument was the prefix and the
-        # second was the server. Here we swap them if needed now that the prefix
-        # is optional.
-        if isinstance(server, str):
-            if fastmcp.settings.deprecation_warnings:
-                warnings.warn(
-                    "Mount prefixes are now optional and the first positional argument "
-                    "should be the server you want to mount.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            server, prefix = cast(FastMCP[Any], prefix), server
+        from fastmcp.server.providers.fastmcp_provider import FastMCPProvider
 
-        if tool_separator is not None:
-            # Deprecated since 2.4.0
-            if fastmcp.settings.deprecation_warnings:
-                warnings.warn(
-                    "The tool_separator parameter is deprecated and will be removed in a future version. "
-                    "Tools are now prefixed using 'prefix_toolname' format.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
+        # Handle deprecated prefix parameter
+        if prefix is not None:
+            warnings.warn(
+                "The 'prefix' parameter is deprecated, use 'namespace' instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if namespace is None:
+                namespace = prefix
+            else:
+                raise ValueError("Cannot specify both 'prefix' and 'namespace'")
 
-        if resource_separator is not None:
-            # Deprecated since 2.4.0
-            if fastmcp.settings.deprecation_warnings:
-                warnings.warn(
-                    "The resource_separator parameter is deprecated and ignored. "
-                    "Resource prefixes are now added using the protocol://prefix/path format.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
+        if as_proxy is not None:
+            warnings.warn(
+                "as_proxy is deprecated and will be removed in a future version. "
+                "Mounted servers now always have their lifespan and middleware invoked. "
+                "To create a proxy server, use create_proxy() explicitly.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            # Still honor the flag for backward compatibility
+            if as_proxy:
+                from fastmcp.server.providers.proxy import FastMCPProxy
 
-        if prompt_separator is not None:
-            # Deprecated since 2.4.0
-            if fastmcp.settings.deprecation_warnings:
-                warnings.warn(
-                    "The prompt_separator parameter is deprecated and will be removed in a future version. "
-                    "Prompts are now prefixed using 'prefix_promptname' format.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
+                if not isinstance(server, FastMCPProxy):
+                    server = FastMCP.as_proxy(server)
 
-        # if as_proxy is not specified and the server has a custom lifespan,
-        # we should treat it as a proxy
-        if as_proxy is None:
-            as_proxy = server._has_lifespan
-
-        if as_proxy and not isinstance(server, FastMCPProxy):
-            server = FastMCP.as_proxy(server)
-
-        # Delegate mounting to all three managers
-        mounted_server = MountedServer(
-            prefix=prefix,
-            server=server,
-            resource_prefix_format=self.resource_prefix_format,
-        )
-        self._mounted_servers.append(mounted_server)
-        self._tool_manager.mount(mounted_server)
-        self._resource_manager.mount(mounted_server)
-        self._prompt_manager.mount(mounted_server)
+        # Create provider with optional transforms
+        provider: Provider = FastMCPProvider(server)
+        if namespace:
+            provider.add_transform(Namespace(namespace))
+        if tool_names:
+            # Tool renames are implemented as a ToolTransform
+            # Keys must use the namespaced names (after Namespace transform)
+            transforms = {
+                (
+                    f"{namespace}_{old_name}" if namespace else old_name
+                ): ToolTransformConfig(name=new_name)
+                for old_name, new_name in tool_names.items()
+            }
+            provider.add_transform(ToolTransform(transforms))
+        self._providers.append(provider)
 
     async def import_server(
         self,
         server: FastMCP[LifespanResultT],
         prefix: str | None = None,
-        tool_separator: str | None = None,
-        resource_separator: str | None = None,
-        prompt_separator: str | None = None,
     ) -> None:
         """
         Import the MCP objects from another FastMCP server into this one,
         optionally with a given prefix.
+
+        .. deprecated::
+            Use :meth:`mount` instead. ``import_server`` will be removed in a
+            future version.
 
         Note that when a server is *imported*, its objects are immediately
         registered to the importing server. This is a one-time operation and
@@ -1896,88 +2915,58 @@ class FastMCP(Generic[LifespanResultT]):
             server: The FastMCP server to import
             prefix: Optional prefix to use for the imported server's objects. If None,
                 objects are imported with their original names.
-            tool_separator: Deprecated. Separator for tool names.
-            resource_separator: Deprecated and ignored. Prefix is now
-              applied using the protocol://prefix/path format
-            prompt_separator: Deprecated. Separator for prompt names.
         """
+        import warnings
 
-        # Deprecated since 2.9.0
-        # Prior to 2.9.0, the first positional argument was the prefix and the
-        # second was the server. Here we swap them if needed now that the prefix
-        # is optional.
-        if isinstance(server, str):
-            if fastmcp.settings.deprecation_warnings:
-                warnings.warn(
-                    "Import prefixes are now optional and the first positional argument "
-                    "should be the server you want to import.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            server, prefix = cast(FastMCP[Any], prefix), server
+        warnings.warn(
+            "import_server is deprecated, use mount() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
-        if tool_separator is not None:
-            # Deprecated since 2.4.0
-            if fastmcp.settings.deprecation_warnings:
-                warnings.warn(
-                    "The tool_separator parameter is deprecated and will be removed in a future version. "
-                    "Tools are now prefixed using 'prefix_toolname' format.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-
-        if resource_separator is not None:
-            # Deprecated since 2.4.0
-            if fastmcp.settings.deprecation_warnings:
-                warnings.warn(
-                    "The resource_separator parameter is deprecated and ignored. "
-                    "Resource prefixes are now added using the protocol://prefix/path format.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-
-        if prompt_separator is not None:
-            # Deprecated since 2.4.0
-            if fastmcp.settings.deprecation_warnings:
-                warnings.warn(
-                    "The prompt_separator parameter is deprecated and will be removed in a future version. "
-                    "Prompts are now prefixed using 'prefix_promptname' format.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
+        def add_resource_prefix(uri: str, prefix: str) -> str:
+            """Add prefix to resource URI: protocol://path → protocol://prefix/path."""
+            match = URI_PATTERN.match(uri)
+            if match:
+                protocol, path = match.groups()
+                return f"{protocol}{prefix}/{path}"
+            return uri
 
         # Import tools from the server
-        for key, tool in (await server.get_tools()).items():
+        for tool in await server.get_tools():
             if prefix:
-                tool = tool.model_copy(key=f"{prefix}_{key}")
-            self._tool_manager.add_tool(tool)
+                tool = tool.model_copy(update={"name": f"{prefix}_{tool.name}"})
+            self.add_tool(tool)
 
         # Import resources and templates from the server
-        for key, resource in (await server.get_resources()).items():
+        for resource in await server.get_resources():
             if prefix:
-                resource_key = add_resource_prefix(
-                    key, prefix, self.resource_prefix_format
-                )
-                resource = resource.model_copy(
-                    update={"name": f"{prefix}_{resource.name}"}, key=resource_key
-                )
-            self._resource_manager.add_resource(resource)
+                new_uri = add_resource_prefix(str(resource.uri), prefix)
+                resource = resource.model_copy(update={"uri": new_uri})
+            self.add_resource(resource)
 
-        for key, template in (await server.get_resource_templates()).items():
+        for template in await server.get_resource_templates():
             if prefix:
-                template_key = add_resource_prefix(
-                    key, prefix, self.resource_prefix_format
-                )
+                new_uri_template = add_resource_prefix(template.uri_template, prefix)
                 template = template.model_copy(
-                    update={"name": f"{prefix}_{template.name}"}, key=template_key
+                    update={"uri_template": new_uri_template}
                 )
-            self._resource_manager.add_template(template)
+            self.add_template(template)
 
         # Import prompts from the server
-        for key, prompt in (await server.get_prompts()).items():
+        for prompt in await server.get_prompts():
             if prefix:
-                prompt = prompt.model_copy(key=f"{prefix}_{key}")
-            self._prompt_manager.add_prompt(prompt)
+                prompt = prompt.model_copy(update={"name": f"{prefix}_{prompt.name}"})
+            self.add_prompt(prompt)
+
+        if server._lifespan != default_lifespan:
+            from warnings import warn
+
+            warn(
+                message="When importing from a server with a lifespan, the lifespan from the imported server will not be used.",
+                category=RuntimeWarning,
+                stacklevel=2,
+            )
 
         if prefix:
             logger.debug(
@@ -1991,66 +2980,80 @@ class FastMCP(Generic[LifespanResultT]):
         cls,
         openapi_spec: dict[str, Any],
         client: httpx.AsyncClient,
-        route_maps: list[RouteMap] | list[RouteMapNew] | None = None,
-        route_map_fn: OpenAPIRouteMapFn | OpenAPIRouteMapFnNew | None = None,
-        mcp_component_fn: OpenAPIComponentFn | OpenAPIComponentFnNew | None = None,
+        name: str = "OpenAPI Server",
+        route_maps: list[RouteMap] | None = None,
+        route_map_fn: OpenAPIRouteMapFn | None = None,
+        mcp_component_fn: OpenAPIComponentFn | None = None,
         mcp_names: dict[str, str] | None = None,
         tags: set[str] | None = None,
+        timeout: float | None = None,
         **settings: Any,
-    ) -> FastMCPOpenAPI | FastMCPOpenAPINew:
+    ) -> Self:
         """
         Create a FastMCP server from an OpenAPI specification.
+
+        Args:
+            openapi_spec: OpenAPI schema as a dictionary
+            client: httpx AsyncClient for making HTTP requests
+            name: Name for the MCP server
+            route_maps: Optional list of RouteMap objects defining route mappings
+            route_map_fn: Optional callable for advanced route type mapping
+            mcp_component_fn: Optional callable for component customization
+            mcp_names: Optional dictionary mapping operationId to component names
+            tags: Optional set of tags to add to all components
+            timeout: Optional timeout (in seconds) for all requests
+            **settings: Additional settings passed to FastMCP
+
+        Returns:
+            A FastMCP server with an OpenAPIProvider attached.
         """
+        from .providers.openapi import OpenAPIProvider
 
-        # Check if experimental parser is enabled
-        if fastmcp.settings.experimental.enable_new_openapi_parser:
-            from fastmcp.experimental.server.openapi import FastMCPOpenAPI
-
-            return FastMCPOpenAPI(
-                openapi_spec=openapi_spec,
-                client=client,
-                route_maps=cast(Any, route_maps),
-                route_map_fn=cast(Any, route_map_fn),
-                mcp_component_fn=cast(Any, mcp_component_fn),
-                mcp_names=mcp_names,
-                tags=tags,
-                **settings,
-            )
-        else:
-            logger.info(
-                "Using legacy OpenAPI parser. To use the new parser, set "
-                "FASTMCP_EXPERIMENTAL_ENABLE_NEW_OPENAPI_PARSER=true. The new parser "
-                "was introduced for testing in 2.11 and will become the default soon."
-            )
-            from .openapi import FastMCPOpenAPI
-
-            return FastMCPOpenAPI(
-                openapi_spec=openapi_spec,
-                client=client,
-                route_maps=cast(Any, route_maps),
-                route_map_fn=cast(Any, route_map_fn),
-                mcp_component_fn=cast(Any, mcp_component_fn),
-                mcp_names=mcp_names,
-                tags=tags,
-                **settings,
-            )
+        provider: Provider = OpenAPIProvider(
+            openapi_spec=openapi_spec,
+            client=client,
+            route_maps=route_maps,
+            route_map_fn=route_map_fn,
+            mcp_component_fn=mcp_component_fn,
+            mcp_names=mcp_names,
+            tags=tags,
+            timeout=timeout,
+        )
+        return cls(name=name, providers=[provider], **settings)
 
     @classmethod
     def from_fastapi(
         cls,
         app: Any,
         name: str | None = None,
-        route_maps: list[RouteMap] | list[RouteMapNew] | None = None,
-        route_map_fn: OpenAPIRouteMapFn | OpenAPIRouteMapFnNew | None = None,
-        mcp_component_fn: OpenAPIComponentFn | OpenAPIComponentFnNew | None = None,
+        route_maps: list[RouteMap] | None = None,
+        route_map_fn: OpenAPIRouteMapFn | None = None,
+        mcp_component_fn: OpenAPIComponentFn | None = None,
         mcp_names: dict[str, str] | None = None,
         httpx_client_kwargs: dict[str, Any] | None = None,
         tags: set[str] | None = None,
+        timeout: float | None = None,
         **settings: Any,
-    ) -> FastMCPOpenAPI | FastMCPOpenAPINew:
+    ) -> Self:
         """
         Create a FastMCP server from a FastAPI application.
+
+        Args:
+            app: FastAPI application instance
+            name: Name for the MCP server (defaults to app.title)
+            route_maps: Optional list of RouteMap objects defining route mappings
+            route_map_fn: Optional callable for advanced route type mapping
+            mcp_component_fn: Optional callable for component customization
+            mcp_names: Optional dictionary mapping operationId to component names
+            httpx_client_kwargs: Optional kwargs passed to httpx.AsyncClient
+            tags: Optional set of tags to add to all components
+            timeout: Optional timeout (in seconds) for all requests
+            **settings: Additional settings passed to FastMCP
+
+        Returns:
+            A FastMCP server with an OpenAPIProvider attached.
         """
+        from .providers.openapi import OpenAPIProvider
 
         if httpx_client_kwargs is None:
             httpx_client_kwargs = {}
@@ -2061,42 +3064,19 @@ class FastMCP(Generic[LifespanResultT]):
             **httpx_client_kwargs,
         )
 
-        name = name or app.title
+        server_name = name or app.title
 
-        # Check if experimental parser is enabled
-        if fastmcp.settings.experimental.enable_new_openapi_parser:
-            from fastmcp.experimental.server.openapi import FastMCPOpenAPI
-
-            return FastMCPOpenAPI(
-                openapi_spec=app.openapi(),
-                client=client,
-                name=name,
-                route_maps=cast(Any, route_maps),
-                route_map_fn=cast(Any, route_map_fn),
-                mcp_component_fn=cast(Any, mcp_component_fn),
-                mcp_names=mcp_names,
-                tags=tags,
-                **settings,
-            )
-        else:
-            logger.info(
-                "Using legacy OpenAPI parser. To use the new parser, set "
-                "FASTMCP_EXPERIMENTAL_ENABLE_NEW_OPENAPI_PARSER=true. The new parser "
-                "was introduced for testing in 2.11 and will become the default soon."
-            )
-            from .openapi import FastMCPOpenAPI
-
-            return FastMCPOpenAPI(
-                openapi_spec=app.openapi(),
-                client=client,
-                name=name,
-                route_maps=cast(Any, route_maps),
-                route_map_fn=cast(Any, route_map_fn),
-                mcp_component_fn=cast(Any, mcp_component_fn),
-                mcp_names=mcp_names,
-                tags=tags,
-                **settings,
-            )
+        provider: Provider = OpenAPIProvider(
+            openapi_spec=app.openapi(),
+            client=client,
+            route_maps=route_maps,
+            route_map_fn=route_map_fn,
+            mcp_component_fn=mcp_component_fn,
+            mcp_names=mcp_names,
+            tags=tags,
+            timeout=timeout,
+        )
+        return cls(name=server_name, providers=[provider], **settings)
 
     @classmethod
     def as_proxy(
@@ -2105,6 +3085,7 @@ class FastMCP(Generic[LifespanResultT]):
             Client[ClientTransportT]
             | ClientTransport
             | FastMCP[Any]
+            | FastMCP1Server
             | AnyUrl
             | Path
             | MCPConfig
@@ -2115,99 +3096,24 @@ class FastMCP(Generic[LifespanResultT]):
     ) -> FastMCPProxy:
         """Create a FastMCP proxy server for the given backend.
 
+        .. deprecated::
+            Use :func:`fastmcp.server.create_proxy` instead.
+            This method will be removed in a future version.
+
         The `backend` argument can be either an existing `fastmcp.client.Client`
         instance or any value accepted as the `transport` argument of
         `fastmcp.client.Client`. This mirrors the convenience of the
         `fastmcp.client.Client` constructor.
         """
-        from fastmcp.client.client import Client
-        from fastmcp.server.proxy import FastMCPProxy, ProxyClient
-
-        if isinstance(backend, Client):
-            client = backend
-            # Session strategy based on client connection state:
-            # - Connected clients: reuse existing session for all requests
-            # - Disconnected clients: create fresh sessions per request for isolation
-            if client.is_connected():
-                _proxy_logger = get_logger(__name__)
-                _proxy_logger.info(
-                    "Proxy detected connected client - reusing existing session for all requests. "
-                    "This may cause context mixing in concurrent scenarios."
-                )
-
-                # Reuse sessions - return the same client instance
-                def reuse_client_factory():
-                    return client
-
-                client_factory = reuse_client_factory
-            else:
-                # Fresh sessions per request
-                def fresh_client_factory():
-                    return client.new()
-
-                client_factory = fresh_client_factory
-        else:
-            base_client = ProxyClient(backend)
-
-            # Fresh client created from transport - use fresh sessions per request
-            def proxy_client_factory():
-                return base_client.new()
-
-            client_factory = proxy_client_factory
-
-        return FastMCPProxy(client_factory=client_factory, **settings)
-
-    @classmethod
-    def from_client(
-        cls, client: Client[ClientTransportT], **settings: Any
-    ) -> FastMCPProxy:
-        """
-        Create a FastMCP proxy server from a FastMCP client.
-        """
-        # Deprecated since 2.3.5
         if fastmcp.settings.deprecation_warnings:
             warnings.warn(
-                "FastMCP.from_client() is deprecated; use FastMCP.as_proxy() instead.",
+                "FastMCP.as_proxy() is deprecated. Use create_proxy() from "
+                "fastmcp.server instead: `from fastmcp.server import create_proxy`",
                 DeprecationWarning,
                 stacklevel=2,
             )
-
-        return cls.as_proxy(client, **settings)
-
-    def _should_enable_component(
-        self,
-        component: FastMCPComponent,
-    ) -> bool:
-        """
-        Given a component, determine if it should be enabled. Returns True if it should be enabled; False if it should not.
-
-        Rules:
-            - If the component's enabled property is False, always return False.
-            - If both include_tags and exclude_tags are None, return True.
-            - If exclude_tags is provided, check each exclude tag:
-                - If the exclude tag is a string, it must be present in the input tags to exclude.
-            - If include_tags is provided, check each include tag:
-                - If the include tag is a string, it must be present in the input tags to include.
-            - If include_tags is provided and none of the include tags match, return False.
-            - If include_tags is not provided, return True.
-        """
-        if not component.enabled:
-            return False
-
-        if self.include_tags is None and self.exclude_tags is None:
-            return True
-
-        if self.exclude_tags is not None:
-            if any(etag in component.tags for etag in self.exclude_tags):
-                return False
-
-        if self.include_tags is not None:
-            if any(itag in component.tags for itag in self.include_tags):
-                return True
-            else:
-                return False
-
-        return True
+        # Call the module-level create_proxy function directly
+        return create_proxy(backend, **settings)
 
     @classmethod
     def generate_name(cls, name: str | None = None) -> str:
@@ -2219,197 +3125,61 @@ class FastMCP(Generic[LifespanResultT]):
             return f"{class_name}-{name}-{secrets.token_hex(2)}"
 
 
-@dataclass
-class MountedServer:
-    prefix: str | None
-    server: FastMCP[Any]
-    resource_prefix_format: Literal["protocol", "path"] | None = None
+# -----------------------------------------------------------------------------
+# Module-level Factory Functions
+# -----------------------------------------------------------------------------
 
 
-def add_resource_prefix(
-    uri: str, prefix: str, prefix_format: Literal["protocol", "path"] | None = None
-) -> str:
-    """Add a prefix to a resource URI.
+def create_proxy(
+    target: (
+        Client[ClientTransportT]
+        | ClientTransport
+        | FastMCP[Any]
+        | FastMCP1Server
+        | AnyUrl
+        | Path
+        | MCPConfig
+        | dict[str, Any]
+        | str
+    ),
+    **settings: Any,
+) -> FastMCPProxy:
+    """Create a FastMCP proxy server for the given target.
 
-    Args:
-        uri: The original resource URI
-        prefix: The prefix to add
-
-    Returns:
-        The resource URI with the prefix added
-
-    Examples:
-        With new style:
-        ```python
-        add_resource_prefix("resource://path/to/resource", "prefix")
-        "resource://prefix/path/to/resource"
-        ```
-        With legacy style:
-        ```python
-        add_resource_prefix("resource://path/to/resource", "prefix")
-        "prefix+resource://path/to/resource"
-        ```
-        With absolute path:
-        ```python
-        add_resource_prefix("resource:///absolute/path", "prefix")
-        "resource://prefix//absolute/path"
-        ```
-
-    Raises:
-        ValueError: If the URI doesn't match the expected protocol://path format
-    """
-    if not prefix:
-        return uri
-
-    # Get the server settings to check for legacy format preference
-
-    if prefix_format is None:
-        prefix_format = fastmcp.settings.resource_prefix_format
-
-    if prefix_format == "protocol":
-        # Legacy style: prefix+protocol://path
-        return f"{prefix}+{uri}"
-    elif prefix_format == "path":
-        # New style: protocol://prefix/path
-        # Split the URI into protocol and path
-        match = URI_PATTERN.match(uri)
-        if not match:
-            raise ValueError(
-                f"Invalid URI format: {uri}. Expected protocol://path format."
-            )
-
-        protocol, path = match.groups()
-
-        # Add the prefix to the path
-        return f"{protocol}{prefix}/{path}"
-    else:
-        raise ValueError(f"Invalid prefix format: {prefix_format}")
-
-
-def remove_resource_prefix(
-    uri: str, prefix: str, prefix_format: Literal["protocol", "path"] | None = None
-) -> str:
-    """Remove a prefix from a resource URI.
+    This is the recommended way to create a proxy server. For lower-level control,
+    use `FastMCPProxy` or `ProxyProvider` directly from `fastmcp.server.providers.proxy`.
 
     Args:
-        uri: The resource URI with a prefix
-        prefix: The prefix to remove
-        prefix_format: The format of the prefix to remove
-    Returns:
-        The resource URI with the prefix removed
-
-    Examples:
-        With new style:
-        ```python
-        remove_resource_prefix("resource://prefix/path/to/resource", "prefix")
-        "resource://path/to/resource"
-        ```
-        With legacy style:
-        ```python
-        remove_resource_prefix("prefix+resource://path/to/resource", "prefix")
-        "resource://path/to/resource"
-        ```
-        With absolute path:
-        ```python
-        remove_resource_prefix("resource://prefix//absolute/path", "prefix")
-        "resource:///absolute/path"
-        ```
-
-    Raises:
-        ValueError: If the URI doesn't match the expected protocol://path format
-    """
-    if not prefix:
-        return uri
-
-    if prefix_format is None:
-        prefix_format = fastmcp.settings.resource_prefix_format
-
-    if prefix_format == "protocol":
-        # Legacy style: prefix+protocol://path
-        legacy_prefix = f"{prefix}+"
-        if uri.startswith(legacy_prefix):
-            return uri[len(legacy_prefix) :]
-        return uri
-    elif prefix_format == "path":
-        # New style: protocol://prefix/path
-        # Split the URI into protocol and path
-        match = URI_PATTERN.match(uri)
-        if not match:
-            raise ValueError(
-                f"Invalid URI format: {uri}. Expected protocol://path format."
-            )
-
-        protocol, path = match.groups()
-
-        # Check if the path starts with the prefix followed by a /
-        prefix_pattern = f"^{re.escape(prefix)}/(.*?)$"
-        path_match = re.match(prefix_pattern, path)
-        if not path_match:
-            return uri
-
-        # Return the URI without the prefix
-        return f"{protocol}{path_match.group(1)}"
-    else:
-        raise ValueError(f"Invalid prefix format: {prefix_format}")
-
-
-def has_resource_prefix(
-    uri: str, prefix: str, prefix_format: Literal["protocol", "path"] | None = None
-) -> bool:
-    """Check if a resource URI has a specific prefix.
-
-    Args:
-        uri: The resource URI to check
-        prefix: The prefix to look for
+        target: The backend to proxy to. Can be:
+            - A Client instance (connected or disconnected)
+            - A ClientTransport
+            - A FastMCP server instance
+            - A URL string or AnyUrl
+            - A Path to a server script
+            - An MCPConfig or dict
+        **settings: Additional settings passed to FastMCPProxy (name, etc.)
 
     Returns:
-        True if the URI has the specified prefix, False otherwise
+        A FastMCPProxy server that proxies to the target.
 
-    Examples:
-        With new style:
+    Example:
         ```python
-        has_resource_prefix("resource://prefix/path/to/resource", "prefix")
-        True
-        ```
-        With legacy style:
-        ```python
-        has_resource_prefix("prefix+resource://path/to/resource", "prefix")
-        True
-        ```
-        With other path:
-        ```python
-        has_resource_prefix("resource://other/path/to/resource", "prefix")
-        False
-        ```
+        from fastmcp.server import create_proxy
 
-    Raises:
-        ValueError: If the URI doesn't match the expected protocol://path format
+        # Create a proxy to a remote server
+        proxy = create_proxy("http://remote-server/mcp")
+
+        # Create a proxy to another FastMCP server
+        proxy = create_proxy(other_server)
+        ```
     """
-    if not prefix:
-        return False
+    from fastmcp.server.providers.proxy import (
+        FastMCPProxy,
+        _create_client_factory,
+    )
 
-    # Get the server settings to check for legacy format preference
-
-    if prefix_format is None:
-        prefix_format = fastmcp.settings.resource_prefix_format
-
-    if prefix_format == "protocol":
-        # Legacy style: prefix+protocol://path
-        legacy_prefix = f"{prefix}+"
-        return uri.startswith(legacy_prefix)
-    elif prefix_format == "path":
-        # New style: protocol://prefix/path
-        # Split the URI into protocol and path
-        match = URI_PATTERN.match(uri)
-        if not match:
-            raise ValueError(
-                f"Invalid URI format: {uri}. Expected protocol://path format."
-            )
-
-        _, path = match.groups()
-
-        # Check if the path starts with the prefix followed by a /
-        prefix_pattern = f"^{re.escape(prefix)}/"
-        return bool(re.match(prefix_pattern, path))
-    else:
-        raise ValueError(f"Invalid prefix format: {prefix_format}")
+    client_factory = _create_client_factory(target)
+    return FastMCPProxy(
+        client_factory=client_factory,
+        **settings,
+    )

@@ -23,6 +23,17 @@ Alternatively, you can install it directly with `pip` or `uv pip`:
     ```
 </CodeGroup>
 
+### Optional Dependencies
+
+FastMCP provides optional extras for specific features:
+
+```bash
+# Background tasks (Docket-based distributed task scheduling)
+pip install "fastmcp[tasks]"
+```
+
+See [Background Tasks](/servers/tasks) for details on the task system.
+
 ### Verify Installation
 
 To verify that FastMCP is installed correctly, you can run the following command:
@@ -42,6 +53,20 @@ Python version:                            3.12.2
 Platform:            macOS-15.3.1-arm64-arm-64bit
 FastMCP root path:            ~/Developer/fastmcp
 ```
+
+### Dependency Licensing
+
+<Info>
+FastMCP depends on Cyclopts for CLI functionality. Cyclopts v4 includes docutils as a transitive dependency, which has complex licensing that may trigger compliance reviews in some organizations.
+
+If this is a concern, you can install Cyclopts v5 alpha which removes this dependency:
+
+```bash
+pip install "cyclopts>=5.0.0a1"
+```
+
+Alternatively, wait for the stable v5 release. See [this issue](https://github.com/BrianPugh/cyclopts/issues/672) for details.
+</Info>
 ## Upgrading from the Official MCP SDK
 
 Upgrading from the official MCP SDK's FastMCP 1.0 to FastMCP 2.0 is generally straightforward. The core server API is highly compatible, and in many cases, changing your import statement from `from mcp.server.fastmcp import FastMCP` to `from fastmcp import FastMCP` will be sufficient. 
@@ -71,7 +96,19 @@ fastmcp==2.11.0  # Good
 fastmcp>=2.11.0  # Bad - will install breaking changes
 ```
 
-See the full [versioning and release policy](/development/releases#versioning-policy) for details on our public API, deprecation practices, and breaking change philosophy. 
+See the full [versioning and release policy](/development/releases#versioning-policy) for details on our public API, deprecation practices, and breaking change philosophy.
+
+### Looking Ahead: FastMCP 4.0
+
+The MCP Python SDK v2 is expected in early 2026 and will include breaking changes. When released, FastMCP will incorporate these upstream changes in a new major version (FastMCP 4.0).
+
+To avoid unexpected breaking changes, we recommend pinning your dependency with an upper bound:
+
+```
+fastmcp>=3.0,<4
+```
+
+We'll provide migration guidance when FastMCP 4.0 is released. 
 
 ## Contributing to FastMCP
 

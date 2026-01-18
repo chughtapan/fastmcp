@@ -4,6 +4,7 @@ import inspect
 import warnings
 from collections.abc import Callable
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, cast
 
@@ -14,7 +15,8 @@ from pydantic.fields import Field
 from pydantic.functional_validators import BeforeValidator
 
 import fastmcp
-from fastmcp.tools.tool import ParsedFunction, Tool, ToolResult, _convert_to_content
+from fastmcp.tools.function_parsing import ParsedFunction
+from fastmcp.tools.tool import Tool, ToolResult, _convert_to_content
 from fastmcp.utilities.components import _convert_set_default_none
 from fastmcp.utilities.json_schema import compress_schema
 from fastmcp.utilities.logging import get_logger
@@ -29,12 +31,12 @@ logger = get_logger(__name__)
 
 
 # Context variable to store current transformed tool
-_current_tool: ContextVar[TransformedTool | None] = ContextVar(  # type: ignore[assignment]
+_current_tool: ContextVar[TransformedTool | None] = ContextVar(
     "_current_tool", default=None
 )
 
 
-async def forward(**kwargs) -> ToolResult:
+async def forward(**kwargs: Any) -> ToolResult:
     """Forward to parent tool with argument transformation applied.
 
     This function can only be called from within a transformed tool's custom
@@ -64,7 +66,7 @@ async def forward(**kwargs) -> ToolResult:
     return await tool.forwarding_fn(**kwargs)
 
 
-async def forward_raw(**kwargs) -> ToolResult:
+async def forward_raw(**kwargs: Any) -> ToolResult:
     """Forward directly to parent tool without transformation.
 
     This function bypasses all argument transformation and validation, calling the parent
@@ -365,16 +367,16 @@ class TransformedTool(Tool):
         cls,
         tool: Tool,
         name: str | None = None,
-        title: str | None | NotSetT = NotSet,
-        description: str | None | NotSetT = NotSet,
+        version: str | NotSetT | None = NotSet,
+        title: str | NotSetT | None = NotSet,
+        description: str | NotSetT | None = NotSet,
         tags: set[str] | None = None,
         transform_fn: Callable[..., Any] | None = None,
         transform_args: dict[str, ArgTransform] | None = None,
-        annotations: ToolAnnotations | None | NotSetT = NotSet,
-        output_schema: dict[str, Any] | None | NotSetT | Literal[False] = NotSet,
-        serializer: Callable[[Any], str] | None | NotSetT = NotSet,
-        meta: dict[str, Any] | None | NotSetT = NotSet,
-        enabled: bool | None = None,
+        annotations: ToolAnnotations | NotSetT | None = NotSet,
+        output_schema: dict[str, Any] | NotSetT | None = NotSet,
+        serializer: Callable[[Any], str] | NotSetT | None = NotSet,  # Deprecated
+        meta: dict[str, Any] | NotSetT | None = NotSet,
     ) -> TransformedTool:
         """Create a transformed tool from a parent tool.
 
@@ -384,6 +386,7 @@ class TransformedTool(Tool):
                 to call the parent tool. Functions with **kwargs receive transformed
                 argument names.
             name: New name for the tool. Defaults to parent tool's name.
+            version: New version for the tool. Defaults to parent tool's version.
             title: New title for the tool. Defaults to parent tool's title.
             transform_args: Optional transformations for parent tool arguments.
                 Only specified arguments are transformed, others pass through unchanged:
@@ -397,7 +400,7 @@ class TransformedTool(Tool):
                 - None (default): Inherit from transform_fn if available, then parent tool
                 - dict: Use custom output schema
                 - False: Disable output schema and structured outputs
-            serializer: New serializer. Defaults to parent's serializer.
+            serializer: Deprecated. Return ToolResult from your tools for full control over serialization.
             meta: Control meta information:
                 - NotSet (default): Inherit from parent tool
                 - dict: Use custom meta information
@@ -450,6 +453,18 @@ class TransformedTool(Tool):
                 )
             ```
         """
+        if (
+            serializer is not NotSet
+            and serializer is not None
+            and fastmcp.settings.deprecation_warnings
+        ):
+            warnings.warn(
+                "The `serializer` parameter is deprecated. "
+                "Return ToolResult from your tools for full control over serialization. "
+                "See https://gofastmcp.com/servers/tools#custom-serialization for migration examples.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         transform_args = transform_args or {}
 
         if transform_fn is not None:
@@ -486,15 +501,6 @@ class TransformedTool(Tool):
                         final_output_schema = tool.output_schema
             else:
                 final_output_schema = tool.output_schema
-        elif output_schema is False:
-            # Handle False as deprecated synonym for None (deprecated in 2.11.4)
-            if fastmcp.settings.deprecation_warnings:
-                warnings.warn(
-                    "Passing output_schema=False is deprecated. Use output_schema=None instead.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            final_output_schema = None
         else:
             final_output_schema = cast(dict | None, output_schema)
 
@@ -565,6 +571,7 @@ class TransformedTool(Tool):
                 )
 
         final_name = name or tool.name
+        final_version = version if not isinstance(version, NotSetT) else tool.version
         final_description = (
             description if not isinstance(description, NotSetT) else tool.description
         )
@@ -576,13 +583,13 @@ class TransformedTool(Tool):
         final_serializer = (
             serializer if not isinstance(serializer, NotSetT) else tool.serializer
         )
-        final_enabled = enabled if enabled is not None else tool.enabled
 
         transformed_tool = cls(
             fn=final_fn,
             forwarding_fn=forwarding_fn,
             parent_tool=tool,
             name=final_name,
+            version=final_version,
             title=final_title,
             description=final_description,
             parameters=final_schema,
@@ -592,7 +599,7 @@ class TransformedTool(Tool):
             serializer=final_serializer,
             meta=final_meta,
             transform_args=transform_args,
-            enabled=final_enabled,
+            auth=tool.auth,
         )
 
         return transformed_tool
@@ -620,7 +627,8 @@ class TransformedTool(Tool):
         """
 
         # Build transformed schema and mapping
-        parent_defs = parent_tool.parameters.get("$defs", {})
+        # Deep copy to prevent compress_schema from mutating parent tool's $defs
+        parent_defs = deepcopy(parent_tool.parameters.get("$defs", {}))
         parent_props = parent_tool.parameters.get("properties", {}).copy()
         parent_required = set(parent_tool.parameters.get("required", []))
 
@@ -678,10 +686,10 @@ class TransformedTool(Tool):
 
         if parent_defs:
             schema["$defs"] = parent_defs
-            schema = compress_schema(schema, prune_defs=True)
+            schema = compress_schema(schema)
 
         # Create forwarding function that closes over everything it needs
-        async def _forward(**kwargs):
+        async def _forward(**kwargs: Any):
             # Validate arguments
             valid_args = set(new_props.keys())
             provided_args = set(kwargs.keys())
@@ -861,7 +869,7 @@ class TransformedTool(Tool):
 
         if merged_defs:
             result["$defs"] = merged_defs
-            result = compress_schema(result, prune_defs=True)
+            result = compress_schema(result)
 
         return result
 
@@ -888,7 +896,9 @@ class ToolTransformConfig(FastMCPBaseModel):
     """Provides a way to transform a tool."""
 
     name: str | None = Field(default=None, description="The new name for the tool.")
-
+    version: str | None = Field(
+        default=None, description="The new version for the tool."
+    )
     title: str | None = Field(
         default=None,
         description="The new title of the tool.",
@@ -904,11 +914,6 @@ class ToolTransformConfig(FastMCPBaseModel):
     meta: dict[str, Any] | None = Field(
         default=None,
         description="The new meta information for the tool.",
-    )
-
-    enabled: bool = Field(
-        default=True,
-        description="Whether the tool is enabled.",
     )
 
     arguments: dict[str, ArgTransformConfig] = Field(
@@ -936,17 +941,20 @@ def apply_transformations_to_tools(
 ) -> dict[str, Tool]:
     """Apply a list of transformations to a list of tools. Tools that do not have any transformations
     are left unchanged.
+
+    Note: tools dict is keyed by prefixed key (e.g., "tool:my_tool"),
+    but transformations are keyed by tool name (e.g., "my_tool").
     """
 
     transformed_tools: dict[str, Tool] = {}
 
-    for tool_name, tool in tools.items():
-        if transformation := transformations.get(tool_name):
-            transformed_tools[transformation.name or tool_name] = transformation.apply(
-                tool
-            )
+    for tool_key, tool in tools.items():
+        # Look up transformation by tool name, not prefixed key
+        if transformation := transformations.get(tool.name):
+            transformed = transformation.apply(tool)
+            transformed_tools[transformed.key] = transformed
             continue
 
-        transformed_tools[tool_name] = tool
+        transformed_tools[tool_key] = tool
 
     return transformed_tools

@@ -1,12 +1,12 @@
-import json
+import functools
 from urllib.parse import quote
 
 import pytest
 from pydantic import BaseModel
 
-from fastmcp import Context
+from fastmcp import Context, FastMCP
 from fastmcp.resources import ResourceTemplate
-from fastmcp.resources.resource import FunctionResource
+from fastmcp.resources.function_resource import FunctionResource
 from fastmcp.resources.template import match_uri_template
 
 
@@ -103,7 +103,7 @@ class TestResourceTemplate:
         # This should fail - 'unknown' is not a function parameter
         with pytest.raises(
             ValueError,
-            match="Required function arguments .* must be a subset of the URI parameters",
+            match="Required function arguments .* must be a subset of the URI path parameters",
         ):
             ResourceTemplate.from_function(
                 fn=my_func,
@@ -131,7 +131,7 @@ class TestResourceTemplate:
         # This should fail - required param is not in URI
         with pytest.raises(
             ValueError,
-            match="Required function arguments .* must be a subset of the URI parameters",
+            match="Required function arguments .* must be a subset of the URI path parameters",
         ):
             ResourceTemplate.from_function(
                 fn=func_with_required,
@@ -156,7 +156,7 @@ class TestResourceTemplate:
         # This fails - missing one required param
         with pytest.raises(
             ValueError,
-            match="Required function arguments .* must be a subset of the URI parameters",
+            match="Required function arguments .* must be a subset of the URI path parameters",
         ):
             ResourceTemplate.from_function(
                 fn=multi_required,
@@ -167,8 +167,8 @@ class TestResourceTemplate:
     async def test_create_resource(self):
         """Test creating a resource from a template."""
 
-        def my_func(key: str, value: int) -> dict:
-            return {"key": key, "value": value}
+        def my_func(key: str, value: int) -> str:
+            return f"key={key}, value={value}"
 
         template = ResourceTemplate.from_function(
             fn=my_func,
@@ -182,10 +182,14 @@ class TestResourceTemplate:
         )
 
         assert isinstance(resource, FunctionResource)
-        content = await resource.read()
-        assert isinstance(content, str)
-        data = json.loads(content)
-        assert data == {"key": "foo", "value": 123}
+        # read() returns raw value from function
+        result = await resource.read()
+        assert result == "key=foo, value=123"
+
+        # _read() wraps in ResourceResult
+        resource_result = await resource._read()
+        assert len(resource_result.contents) == 1
+        assert resource_result.contents[0].content == "key=foo, value=123"
 
     async def test_async_text_resource(self):
         """Test creating a text resource from async function."""
@@ -205,8 +209,9 @@ class TestResourceTemplate:
         )
 
         assert isinstance(resource, FunctionResource)
-        content = await resource.read()
-        assert content == "Hello, world!"
+        # read() returns raw value
+        result = await resource.read()
+        assert result == "Hello, world!"
 
     async def test_async_binary_resource(self):
         """Test creating a binary resource from async function."""
@@ -226,8 +231,9 @@ class TestResourceTemplate:
         )
 
         assert isinstance(resource, FunctionResource)
-        content = await resource.read()
-        assert content == b"test"
+        # read() returns raw bytes
+        result = await resource.read()
+        assert result == b"test"
 
     async def test_basemodel_conversion(self):
         """Test handling of BaseModel types."""
@@ -251,9 +257,10 @@ class TestResourceTemplate:
         )
 
         assert isinstance(resource, FunctionResource)
-        content = await resource.read()
-        assert isinstance(content, str)
-        data = json.loads(content)
+        # read() returns raw BaseModel
+        result = await resource.read()
+        assert isinstance(result, MyModel)
+        data = result.model_dump()
         assert data == {"key": "foo", "value": 123}
 
     async def test_custom_type_conversion(self):
@@ -281,8 +288,10 @@ class TestResourceTemplate:
         )
 
         assert isinstance(resource, FunctionResource)
-        content = await resource.read()
-        assert content == '"hello"'
+        # read() returns raw CustomData object
+        result = await resource.read()
+        assert isinstance(result, CustomData)
+        assert str(result) == "hello"
 
     async def test_wildcard_param_can_create_resource(self):
         """Test that wildcard parameters are valid."""
@@ -391,8 +400,9 @@ class TestResourceTemplate:
         )
 
         assert isinstance(resource, FunctionResource)
-        content = await resource.read()
-        assert content == "X was foo"
+        # read() returns raw string from __call__
+        result = await resource.read()
+        assert result == "X was foo"
 
 
 class TestMatchUriTemplate:
@@ -677,8 +687,9 @@ class TestContextHandling:
             )
 
             assert isinstance(resource, FunctionResource)
-            content = await resource.read()
-            assert content == "42"
+            # read() returns the raw value
+            result = await resource.read()
+            assert result == "42"
 
     async def test_context_optional(self):
         """Test that context is optional when creating resources."""
@@ -693,8 +704,6 @@ class TestContextHandling:
         )
 
         # Even for optional context, we need to provide a context
-        from fastmcp import FastMCP
-
         mcp = FastMCP()
         context = Context(fastmcp=mcp)
 
@@ -705,5 +714,296 @@ class TestContextHandling:
             )
 
             assert isinstance(resource, FunctionResource)
-            content = await resource.read()
-            assert content == "42"
+            # read() returns the raw value
+            result = await resource.read()
+            assert result == "42"
+
+    async def test_context_with_functools_wraps_decorator(self):
+        """Regression test for #2524: decorated templates with Context should work."""
+
+        def custom_decorator(func):
+            @functools.wraps(func)
+            async def wrapper(*args, **kwargs):
+                return await func(*args, **kwargs)
+
+            return wrapper
+
+        @custom_decorator
+        async def decorated_template(ctx: Context, item_id: int) -> str:
+            assert isinstance(ctx, Context)
+            return f"item: {item_id}"
+
+        template = ResourceTemplate.from_function(
+            fn=decorated_template,
+            uri_template="test://{item_id}",
+            name="test",
+        )
+
+        mcp = FastMCP()
+        context = Context(fastmcp=mcp)
+
+        async with context:
+            resource = await template.create_resource("test://42", {"item_id": 42})
+            # read() returns the raw value
+            result = await resource.read()
+            assert result == "item: 42"
+
+
+class TestQueryParameterExtraction:
+    """Test basic query parameter extraction from URIs."""
+
+    async def test_single_query_param(self):
+        """Test resource template with single query parameter."""
+
+        def get_data(id: str, format: str = "json") -> str:
+            return f"Data {id} in {format}"
+
+        template = ResourceTemplate.from_function(
+            fn=get_data,
+            uri_template="data://{id}{?format}",
+            name="test",
+        )
+
+        # Match without query param (uses default)
+        params = template.matches("data://123")
+        assert params == {"id": "123"}
+
+        # Match with query param
+        params = template.matches("data://123?format=xml")
+        assert params == {"id": "123", "format": "xml"}
+
+    async def test_multiple_query_params(self):
+        """Test resource template with multiple query parameters."""
+
+        def get_items(category: str, page: int = 1, limit: int = 10) -> str:
+            return f"Category {category}, page {page}, limit {limit}"
+
+        template = ResourceTemplate.from_function(
+            fn=get_items,
+            uri_template="items://{category}{?page,limit}",
+            name="test",
+        )
+
+        # No query params
+        params = template.matches("items://books")
+        assert params == {"category": "books"}
+
+        # One query param
+        params = template.matches("items://books?page=2")
+        assert params == {"category": "books", "page": "2"}
+
+        # Both query params
+        params = template.matches("items://books?page=2&limit=20")
+        assert params == {"category": "books", "page": "2", "limit": "20"}
+
+
+class TestQueryParameterTypeCoercion:
+    """Test type coercion for query parameters."""
+
+    async def test_int_coercion(self):
+        """Test integer type coercion for query parameters."""
+
+        def get_page(resource: str, page: int = 1) -> dict:
+            return {"resource": resource, "page": page, "type": type(page).__name__}
+
+        template = ResourceTemplate.from_function(
+            fn=get_page,
+            uri_template="resource://{resource}{?page}",
+            name="test",
+        )
+
+        # Create resource with string query param
+        resource = await template.create_resource(
+            "resource://docs?page=5",
+            {"resource": "docs", "page": "5"},
+        )
+
+        # read() returns raw dict
+        result = await resource.read()
+        assert isinstance(result, dict)
+        assert result["page"] == 5
+        assert result["type"] == "int"
+
+    async def test_bool_coercion(self):
+        """Test boolean type coercion for query parameters."""
+
+        def get_config(name: str, enabled: bool = False) -> dict:
+            return {"name": name, "enabled": enabled, "type": type(enabled).__name__}
+
+        template = ResourceTemplate.from_function(
+            fn=get_config,
+            uri_template="config://{name}{?enabled}",
+            name="test",
+        )
+
+        # Test true value
+        resource = await template.create_resource(
+            "config://feature?enabled=true",
+            {"name": "feature", "enabled": "true"},
+        )
+        # read() returns raw dict
+        result = await resource.read()
+        assert isinstance(result, dict)
+        assert result["enabled"] is True
+
+        # Test false value
+        resource = await template.create_resource(
+            "config://feature?enabled=false",
+            {"name": "feature", "enabled": "false"},
+        )
+        result = await resource.read()
+        assert isinstance(result, dict)
+        assert result["enabled"] is False
+
+    async def test_float_coercion(self):
+        """Test float type coercion for query parameters."""
+
+        def get_metrics(service: str, threshold: float = 0.5) -> dict:
+            return {
+                "service": service,
+                "threshold": threshold,
+                "type": type(threshold).__name__,
+            }
+
+        template = ResourceTemplate.from_function(
+            fn=get_metrics,
+            uri_template="metrics://{service}{?threshold}",
+            name="test",
+        )
+
+        resource = await template.create_resource(
+            "metrics://api?threshold=0.95",
+            {"service": "api", "threshold": "0.95"},
+        )
+
+        # read() returns raw dict
+        result = await resource.read()
+        assert isinstance(result, dict)
+        assert result["threshold"] == 0.95
+        assert result["type"] == "float"
+
+
+class TestQueryParameterValidation:
+    """Test validation rules for query parameters."""
+
+    def test_query_params_must_be_optional(self):
+        """Test that query parameters must have default values."""
+
+        def invalid_func(id: str, format: str) -> str:
+            return f"Data {id} in {format}"
+
+        with pytest.raises(
+            ValueError,
+            match="Query parameters .* must be optional function parameters with default values",
+        ):
+            ResourceTemplate.from_function(
+                fn=invalid_func,
+                uri_template="data://{id}{?format}",
+                name="test",
+            )
+
+    def test_required_params_in_path(self):
+        """Test that required parameters must be in path."""
+
+        def valid_func(id: str, format: str = "json") -> str:
+            return f"Data {id} in {format}"
+
+        # This should work - required param in path, optional in query
+        template = ResourceTemplate.from_function(
+            fn=valid_func,
+            uri_template="data://{id}{?format}",
+            name="test",
+        )
+        assert template.uri_template == "data://{id}{?format}"
+
+
+class TestQueryParameterWithDefaults:
+    """Test that missing query parameters use default values."""
+
+    async def test_missing_query_param_uses_default(self):
+        """Test that missing query parameters fall back to defaults."""
+
+        def get_data(id: str, format: str = "json", verbose: bool = False) -> dict:
+            return {"id": id, "format": format, "verbose": verbose}
+
+        template = ResourceTemplate.from_function(
+            fn=get_data,
+            uri_template="data://{id}{?format,verbose}",
+            name="test",
+        )
+
+        # No query params - should use defaults
+        resource = await template.create_resource(
+            "data://123",
+            {"id": "123"},
+        )
+
+        # read() returns raw dict
+        result = await resource.read()
+        assert isinstance(result, dict)
+        assert result["format"] == "json"
+        assert result["verbose"] is False
+
+    async def test_partial_query_params(self):
+        """Test providing only some query parameters."""
+
+        def get_data(
+            id: str, format: str = "json", limit: int = 10, offset: int = 0
+        ) -> dict:
+            return {"id": id, "format": format, "limit": limit, "offset": offset}
+
+        template = ResourceTemplate.from_function(
+            fn=get_data,
+            uri_template="data://{id}{?format,limit,offset}",
+            name="test",
+        )
+
+        # Provide only some query params
+        resource = await template.create_resource(
+            "data://123?limit=20",
+            {"id": "123", "limit": "20"},
+        )
+
+        # read() returns raw dict
+        result = await resource.read()
+        assert isinstance(result, dict)
+        assert result["format"] == "json"  # default
+        assert result["limit"] == 20  # provided
+        assert result["offset"] == 0  # default
+
+
+class TestQueryParameterWithWildcards:
+    """Test query parameters combined with wildcard path parameters."""
+
+    async def test_wildcard_with_query_params(self):
+        """Test combining wildcard path params with query params."""
+
+        def get_file(path: str, encoding: str = "utf-8", lines: int = 100) -> dict:
+            return {"path": path, "encoding": encoding, "lines": lines}
+
+        template = ResourceTemplate.from_function(
+            fn=get_file,
+            uri_template="files://{path*}{?encoding,lines}",
+            name="test",
+        )
+
+        # Match path with query params
+        params = template.matches("files://src/test/data.txt?encoding=ascii&lines=50")
+        assert params == {
+            "path": "src/test/data.txt",
+            "encoding": "ascii",
+            "lines": "50",
+        }
+
+        # Create resource
+        resource = await template.create_resource(
+            "files://src/test/data.txt?lines=50",
+            {"path": "src/test/data.txt", "lines": "50"},
+        )
+
+        # read() returns raw dict
+        result = await resource.read()
+        assert isinstance(result, dict)
+        assert result["path"] == "src/test/data.txt"
+        assert result["encoding"] == "utf-8"  # default
+        assert result["lines"] == 50  # provided
